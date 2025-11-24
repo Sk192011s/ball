@@ -3,18 +3,10 @@ import { serve } from "https://deno.land/std@0.208.0/http/server.ts";
 serve(async (req) => {
   const url = new URL(req.url);
 
-  // --- 1. API ROUTE (Backend Logic) ---
+  // --- 1. API ROUTE (Backend) ---
   if (url.pathname === "/api/matches") {
     try {
-      const headers = {
-        "Content-Type": "application/json",
-        "Access-Control-Allow-Origin": "*",
-        "Access-Control-Allow-Methods": "GET, OPTIONS",
-      };
-
-      if (req.method === "OPTIONS") return new Response(null, { headers });
-
-      // Socolive Server Time (Vietnam UTC+7) အတိုင်း ရက်စွဲယူမှ Data ရမှာပါ
+      // Timezone: Vietnam (UTC+7) for Socolive
       const getVNDate = (offset: number) => {
         const d = new Date();
         d.setDate(d.getDate() + offset);
@@ -24,7 +16,6 @@ serve(async (req) => {
         }).format(d).replace(/-/g, "");
       };
 
-      // မနေ့က၊ ဒီနေ့၊ မနက်ဖြန် (၃ ရက်စာ)
       const dates = [getVNDate(-1), getVNDate(0), getVNDate(1)];
       const referer = "https://socolivev.co/";
       const agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36";
@@ -36,16 +27,21 @@ serve(async (req) => {
         allMatches = allMatches.concat(matches);
       }
 
-      // Live ပွဲများကို ထိပ်ဆုံးပို့မည်
+      // Sort: Live first
       allMatches.sort((a, b) => (a.match_status === 'live' ? -1 : 1));
 
-      return new Response(JSON.stringify(allMatches), { headers });
+      return new Response(JSON.stringify(allMatches), {
+        headers: { 
+            "Content-Type": "application/json",
+            "Access-Control-Allow-Origin": "*" 
+        }
+      });
     } catch (e: any) {
       return new Response(JSON.stringify({ error: e.message }), { status: 500, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } });
     }
   }
 
-  // --- 2. FRONTEND UI (HTML Player) ---
+  // --- 2. FRONTEND UI (HTML) ---
   if (url.pathname === "/") {
     return new Response(`
     <!DOCTYPE html>
@@ -53,7 +49,7 @@ serve(async (req) => {
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Football Live MM</title>
+        <title>Soco All Sports</title>
         <script src="https://cdn.tailwindcss.com"></script>
         <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
         <link href="https://fonts.googleapis.com/css2?family=Padauk:wght@400;700&display=swap" rel="stylesheet">
@@ -65,23 +61,20 @@ serve(async (req) => {
         </style>
     </head>
     <body class="p-4 max-w-md mx-auto pb-24">
-        <h1 class="text-xl font-bold text-center mb-6 text-green-400 flex items-center justify-center gap-2">
-            ⚽ Football Live <span class="text-xs text-gray-500">(MM Time)</span>
+        <h1 class="text-xl font-bold text-center mb-6 text-yellow-400 flex items-center justify-center gap-2">
+            🏆 All Sports Live <span class="text-xs text-gray-500">(MM Time)</span>
         </h1>
 
-        <!-- Player -->
         <div id="player-container" class="hidden sticky top-2 z-50 mb-4 bg-black rounded-lg overflow-hidden border border-gray-600 shadow-2xl">
             <video id="video" controls class="w-full aspect-video" autoplay></video>
             <button onclick="closePlayer()" class="w-full bg-red-600 text-white text-xs font-bold py-3">ပိတ်မည် (Close)</button>
         </div>
 
-        <!-- Loading -->
         <div id="loading" class="text-center py-10 text-gray-400">
             <i class="fas fa-circle-notch fa-spin text-2xl mb-2"></i><br>
-            Loading Matches...
+            Loading All Sports...
         </div>
 
-        <!-- List -->
         <div id="match-list" class="space-y-3"></div>
 
         <script>
@@ -93,7 +86,7 @@ serve(async (req) => {
                     const list = document.getElementById('match-list');
                     
                     if (data.length === 0) {
-                        list.innerHTML = '<div class="text-center text-gray-500 py-10">လက်ရှိ ဘောလုံးပွဲများ မရှိသေးပါ</div>';
+                        list.innerHTML = '<div class="text-center text-gray-500 py-10">လက်ရှိ ပွဲစဉ်များ မရှိသေးပါ (No Data Found)</div>';
                         return;
                     }
 
@@ -111,9 +104,9 @@ serve(async (req) => {
                                 btns += \`<button onclick="play('\${s.stream_url}')" class="\${col} text-white text-[10px] px-3 py-1.5 rounded mr-2 shadow font-bold hover:opacity-80">\${label}</button>\`;
                             });
                         } else if (isLive) {
-                            btns = '<span class="text-[10px] text-yellow-500 animate-pulse">Link ရှာနေဆဲ...</span>';
+                            btns = '<span class="text-[10px] text-yellow-500 animate-pulse">Link...</span>';
                         } else {
-                             btns = '<span class="text-[10px] text-gray-600">ပွဲမစသေးပါ</span>';
+                             btns = '<span class="text-[10px] text-gray-600">Upcoming</span>';
                         }
 
                         const html = \`
@@ -175,7 +168,7 @@ serve(async (req) => {
   return new Response("Not Found", { status: 404 });
 });
 
-// --- BACKEND LOGIC (FIXED) ---
+// --- BACKEND LOGIC (NO FILTER) ---
 
 async function fetchServerURL(roomNum: any) {
   try {
@@ -210,12 +203,11 @@ async function fetchMatches(date: string, referer: string, agent: string) {
     const results = [];
 
     for (const it of js.data) {
-      // --- FILTER: FOOTBALL ONLY (SportType 1) ---
-      if (it.sportType !== 1) continue;
+      // NOTE: Filter removed to show ALL sports (Football, Basketball, etc.)
+      // if (it.sportType !== 1) continue; 
 
       const mt = it.matchTime;
       let status;
-      // Live duration estimated 3 hours to be safe
       if (now >= mt && now <= mt + (3 * 60 * 60 * 1000)) status = "live";
       else if (now > mt + (3 * 60 * 60 * 1000)) status = "finished";
       else status = "upcoming";
@@ -231,10 +223,9 @@ async function fetchMatches(date: string, referer: string, agent: string) {
       }
 
       results.push({
-        // Myanmar Timezone Conversion
         match_time: new Date(mt).toLocaleTimeString('en-US', { timeZone: 'Asia/Yangon', hour: '2-digit', minute: '2-digit', hour12: true }),
         match_status: status,
-        home_team_name: it.homeName || it.hostName || "Home", 
+        home_team_name: it.homeName || it.hostName || "Home",
         away_team_name: it.awayName || it.guestName || "Away",
         league_name: it.leagueName || it.subCateName,
         match_score: (it.homeScore !== undefined) ? `${it.homeScore} - ${it.awayScore}` : null,
