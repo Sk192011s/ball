@@ -1,249 +1,282 @@
 import { serve } from "https://deno.land/std@0.208.0/http/server.ts";
 
-// --- 1. SERVER SETUP ---
-Deno.serve(async (req) => {
+serve(async (req) => {
   const url = new URL(req.url);
 
-  // --- 2. API ROUTE (Backend Logic) ---
-  // Frontend ကနေ /api/matches လို့ခေါ်ရင် ဒီအကွက်က အလုပ်လုပ်ပြီး Socolive ဆီက Data သွားယူမယ်
+  // --- 1. API ROUTE (Backend) ---
   if (url.pathname === "/api/matches") {
     try {
-      const referer = "https://socolivev.co/";
-      const agent = "Mozilla/5.0";
+      // Vietnam Time (UTC+7) အတိုင်း ရက်စွဲယူမယ် (Server Time မသုံးဘူး)
+      const getVNDate = (offsetDays = 0) => {
+        const d = new Date();
+        d.setDate(d.getDate() + offsetDays);
+        return new Intl.DateTimeFormat("en-CA", {
+          timeZone: "Asia/Ho_Chi_Minh" // Socolive Server Timezone
+        }).format(d).replace(/-/g, "");
+      };
 
-      // မနေ့က၊ ဒီနေ့၊ မနက်ဖြန် (၃ ရက်စာ)
       const dates = [
-        formatDate(Date.now() - 86400000),
-        formatDate(Date.now()),
-        formatDate(Date.now() + 86400000),
+        getVNDate(-1), // Yesterday
+        getVNDate(0),  // Today
+        getVNDate(1)   // Tomorrow
       ];
 
       let allMatches: any[] = [];
-      for (const d of dates) {
-        const matches = await fetchMatches(d, referer, agent);
+      
+      // ၃ ရက်စာ ပတ်ပြီးဆွဲမယ်
+      for (const date of dates) {
+        const matches = await fetchMatches(date);
         allMatches = allMatches.concat(matches);
       }
 
-      // Live ပွဲတွေကို အပေါ်ဆုံးတင်မယ်
-      allMatches.sort((a, b) => (a.status === 'live' ? -1 : 1));
+      // Live ပွဲတွေ အပေါ်တင်မယ်၊ ပြီးရင် အချိန်နီးတာ စီမယ်
+      allMatches.sort((a, b) => {
+        if (a.match_status === 'live' && b.match_status !== 'live') return -1;
+        if (a.match_status !== 'live' && b.match_status === 'live') return 1;
+        return a.raw_time - b.raw_time;
+      });
 
       return new Response(JSON.stringify(allMatches), {
-        headers: { "Content-Type": "application/json" }
+        headers: { 
+            "Content-Type": "application/json",
+            "Access-Control-Allow-Origin": "*" 
+        }
       });
     } catch (e) {
       return new Response(JSON.stringify({ error: e.message }), { status: 500 });
     }
   }
 
-  // --- 3. FRONTEND ROUTE (HTML Page) ---
-  // Web ကိုဖွင့်လိုက်ရင် ဒီ HTML ကို ပြမယ်
+  // --- 2. FRONTEND ROUTE (HTML) ---
   if (url.pathname === "/") {
-    const html = `
+    return new Response(`
     <!DOCTYPE html>
     <html lang="my">
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Deno Football Live</title>
+        <title>Soco Live</title>
         <script src="https://cdn.tailwindcss.com"></script>
         <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
         <style>
-            body { background-color: #0f172a; color: white; font-family: sans-serif; }
-            .live-badge { animation: pulse 2s infinite; color: #ef4444; font-weight: bold; }
-            @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.5; } 100% { opacity: 1; } }
-            .loader { border: 3px solid #f3f3f3; border-top: 3px solid #3498db; border-radius: 50%; width: 30px; height: 30px; animation: spin 1s linear infinite; margin: 20px auto; }
-            @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+            body { background: #0f172a; color: white; font-family: sans-serif; padding-bottom: 50px; }
+            .live-dot { height: 8px; width: 8px; background-color: #ef4444; border-radius: 50%; display: inline-block; animation: blink 1s infinite; }
+            @keyframes blink { 0% { opacity: 1; } 50% { opacity: 0.4; } 100% { opacity: 1; } }
+            .glass { background: rgba(30, 41, 59, 0.7); backdrop-filter: blur(10px); border: 1px solid rgba(255,255,255,0.1); }
         </style>
     </head>
-    <body class="p-4 max-w-md mx-auto pb-20">
-        <h1 class="text-2xl font-bold text-center mb-4 text-green-400 flex items-center justify-center gap-2">
-            ⚽ Deno Football Live
-        </h1>
+    <body class="max-w-md mx-auto p-4">
+        
+        <div class="flex justify-between items-center mb-6">
+            <h1 class="text-xl font-bold text-green-400 flex items-center gap-2">
+                ⚽ Soco Live <span class="text-xs text-gray-500 px-2 border border-gray-700 rounded">Myanmar</span>
+            </h1>
+            <button onclick="loadMatches()" class="text-sm text-blue-400">Refresh</button>
+        </div>
 
-        <!-- Video Player -->
-        <div id="player-container" class="hidden mb-6 bg-black rounded-lg overflow-hidden shadow-xl border border-slate-600 sticky top-2 z-50">
-            <video id="video" controls class="w-full aspect-video" autoplay></video>
-            <button onclick="closePlayer()" class="w-full bg-red-600 py-2 font-bold text-sm hover:bg-red-700">ပိတ်မည် (Close)</button>
+        <!-- Player -->
+        <div id="player-box" class="hidden sticky top-2 z-50 mb-4">
+            <div class="bg-black rounded-lg overflow-hidden shadow-2xl border border-gray-700">
+                <video id="video" controls class="w-full aspect-video" autoplay></video>
+                <div class="bg-slate-900 p-2 flex justify-between items-center">
+                    <span class="text-xs text-green-400 flex items-center gap-2"><span class="live-dot"></span> Live Stream</span>
+                    <button onclick="closePlayer()" class="text-xs text-red-400 font-bold px-3 py-1 border border-red-900 rounded hover:bg-red-900/50">Close</button>
+                </div>
+            </div>
         </div>
 
         <!-- Loading -->
-        <div id="loading">
-            <div class="loader"></div>
-            <div class="text-center text-gray-400 text-sm">ပွဲစဉ်များကို ရှာနေပါသည်...</div>
+        <div id="loading" class="text-center py-10">
+            <div class="inline-block w-6 h-6 border-2 border-t-transparent border-green-400 rounded-full animate-spin"></div>
+            <p class="text-xs text-gray-500 mt-2">Loading Matches...</p>
         </div>
 
-        <!-- Matches List -->
+        <!-- List -->
         <div id="match-list" class="space-y-3"></div>
 
         <script>
             async function loadMatches() {
-                try {
-                    // Deno Server ရဲ့ API ကို လှမ်းခေါ်မယ်
-                    const res = await fetch('/api/matches');
-                    const matches = await res.json();
-                    
-                    const container = document.getElementById('match-list');
-                    document.getElementById('loading').style.display = 'none';
-                    container.innerHTML = '';
+                const loader = document.getElementById('loading');
+                const list = document.getElementById('match-list');
+                loader.style.display = 'block';
+                list.innerHTML = '';
 
-                    if(matches.length === 0) {
-                        container.innerHTML = '<div class="text-center text-gray-500 mt-10">ပွဲစဉ်များ မရှိသေးပါ</div>';
+                try {
+                    const res = await fetch('/api/matches');
+                    const data = await res.json();
+                    loader.style.display = 'none';
+
+                    if (data.error || data.length === 0) {
+                        list.innerHTML = '<div class="text-center text-gray-500 text-sm py-10">ပွဲစဉ်များ မရှိသေးပါ (No Matches)</div>';
                         return;
                     }
 
-                    matches.forEach(match => {
-                        // Stream Buttons
-                        let streamBtns = '';
-                        if (match.streams && match.streams.length > 0) {
-                            match.streams.forEach(s => {
-                                streamBtns += \`<button onclick="playStream('\${s.url}')" class="bg-green-600 hover:bg-green-500 text-white text-[10px] px-3 py-1.5 rounded mr-2 mb-2 font-bold shadow">▶ \${s.label}</button>\`;
+                    data.forEach(m => {
+                        const isLive = m.match_status === 'live';
+                        const statusHtml = isLive 
+                            ? '<span class="text-red-500 font-bold text-[10px] flex items-center gap-1"><span class="live-dot"></span> LIVE</span>' 
+                            : '<span class="text-gray-500 text-[10px]">' + m.match_time_str + '</span>';
+                        
+                        const borderClass = isLive ? 'border-green-500/30' : 'border-white/5';
+                        const score = m.match_score || 'VS';
+
+                        let btns = '';
+                        if (m.servers && m.servers.length > 0) {
+                            m.servers.forEach(s => {
+                                const label = s.name.includes('HD') ? 'HD' : 'SD';
+                                const color = label === 'HD' ? 'bg-red-600' : 'bg-blue-600';
+                                btns += \`<button onclick="play('\${s.stream_url}')" class="\${color} text-white text-[10px] px-3 py-1.5 rounded shadow font-bold hover:opacity-80 transition">\${label}</button>\`;
                             });
-                        } else if (match.status === 'live') {
-                            streamBtns = '<span class="text-xs text-gray-500 animate-pulse">လင့်ခ်ရှာနေဆဲ...</span>';
+                        } else if (isLive) {
+                            btns = '<span class="text-[10px] text-yellow-500 animate-pulse">Link ရှာနေဆဲ...</span>';
                         }
 
-                        const statusText = match.status === 'live' ? 'LIVE' : (match.status === 'finished' ? 'FT' : match.time);
-                        const statusClass = match.status === 'live' ? 'live-badge' : 'text-gray-400';
-                        const borderClass = match.status === 'live' ? 'border-red-500/50' : 'border-slate-700';
-
                         const html = \`
-                            <div class="bg-slate-800 rounded-xl p-4 shadow-lg border \${borderClass}">
-                                <div class="text-[10px] text-gray-400 mb-3 flex justify-between uppercase tracking-wide font-bold">
-                                    <span class="truncate w-2/3">\${match.league}</span>
-                                    <span class="\${statusClass}">\${statusText}</span>
+                            <div class="glass rounded-xl p-4 shadow-lg \${borderClass}">
+                                <div class="flex justify-between items-center mb-3">
+                                    <span class="text-[10px] text-gray-400 truncate max-w-[150px]">\${m.league_name}</span>
+                                    \${statusHtml}
                                 </div>
-                                <div class="flex justify-between items-center mb-4">
-                                    <div class="text-center w-1/3">
-                                        <img src="\${match.home_icon}" class="w-10 h-10 mx-auto mb-2 bg-white/10 rounded-full p-1">
-                                        <div class="text-xs font-bold truncate">\${match.home}</div>
+                                <div class="flex justify-between items-center text-center mb-3">
+                                    <div class="w-1/3">
+                                        <div class="font-bold text-sm truncate">\${m.home_team_name}</div>
                                     </div>
-                                    <div class="text-2xl font-bold text-white w-1/3 text-center font-mono">
-                                        \${match.score}
-                                    </div>
-                                    <div class="text-center w-1/3">
-                                        <img src="\${match.away_icon}" class="w-10 h-10 mx-auto mb-2 bg-white/10 rounded-full p-1">
-                                        <div class="text-xs font-bold truncate">\${match.away}</div>
+                                    <div class="w-1/3 text-xl font-mono font-bold text-yellow-400 px-2">\${score}</div>
+                                    <div class="w-1/3">
+                                        <div class="font-bold text-sm truncate">\${m.away_team_name}</div>
                                     </div>
                                 </div>
-                                <div class="text-center border-t border-slate-700 pt-3">
-                                    \${streamBtns}
+                                <div class="flex justify-center gap-2 border-t border-white/5 pt-3">
+                                    \${btns}
                                 </div>
                             </div>
                         \`;
-                        container.innerHTML += html;
+                        list.innerHTML += html;
                     });
 
                 } catch (e) {
-                    document.getElementById('loading').innerHTML = "<div class='text-red-400 text-center'>Error loading matches</div>";
-                    console.error(e);
+                    loader.innerHTML = '<div class="text-red-400 text-sm">Error loading data</div>';
                 }
             }
 
-            function playStream(url) {
-                const container = document.getElementById('player-container');
-                const video = document.getElementById('video');
-                container.classList.remove('hidden');
+            function play(url) {
+                const box = document.getElementById('player-box');
+                const vid = document.getElementById('video');
+                box.classList.remove('hidden');
                 window.scrollTo({ top: 0, behavior: 'smooth' });
 
                 if (Hls.isSupported()) {
                     const hls = new Hls();
                     hls.loadSource(url);
-                    hls.attachMedia(video);
-                    hls.on(Hls.Events.MANIFEST_PARSED, function() { video.play(); });
-                } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
-                    video.src = url;
-                    video.addEventListener('loadedmetadata', function() { video.play(); });
+                    hls.attachMedia(vid);
+                    hls.on(Hls.Events.MANIFEST_PARSED, () => vid.play());
+                } else if (vid.canPlayType('application/vnd.apple.mpegurl')) {
+                    vid.src = url;
+                    vid.play();
                 }
             }
 
             function closePlayer() {
-                const video = document.getElementById('video');
-                video.pause();
-                video.src = "";
-                document.getElementById('player-container').classList.add('hidden');
+                const vid = document.getElementById('video');
+                vid.pause();
+                vid.src = "";
+                document.getElementById('player-box').classList.add('hidden');
             }
 
             loadMatches();
         </script>
     </body>
     </html>
-    `;
-    return new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8" } });
+    `, { headers: { "Content-Type": "text/html; charset=utf-8" } });
   }
 
   return new Response("Not Found", { status: 404 });
 });
 
-// --- 4. HELPER FUNCTIONS (Backend Logic) ---
+// --- BACKEND LOGIC ---
 
-function formatDate(ms: number) {
-  return new Date(ms).toISOString().split("T")[0].replace(/-/g, "");
-}
-
-async function fetchServerURL(roomNum: any) {
+// 1. Fetch Matches List
+async function fetchMatches(date: string) {
   try {
-    const res = await fetch(`https://json.vnres.co/room/${roomNum}/detail.json`);
-    const txt = await res.text();
-    const m = txt.match(/detail\((.*)\)/);
-    if (m) {
-      const js = JSON.parse(m[1]);
-      if (js.code === 200 && js.data && js.data.stream) {
-        return { m3u8: js.data.stream.m3u8, hdM3u8: js.data.stream.hdM3u8 };
-      }
-    }
-  } catch (e) { /* ignore */ }
-  return { m3u8: null, hdM3u8: null };
-}
-
-async function fetchMatches(date: string, referer: string, agent: string) {
-  try {
+    // Socolive JSON endpoint
     const res = await fetch(`https://json.vnres.co/match/matches_${date}.json`, {
-      headers: { referer, "user-agent": agent, origin: "https://json.vnres.co" }
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+        "Referer": "https://socolivev.co/",
+        "Origin": "https://socolivev.co"
+      }
     });
-    const txt = await res.text();
-    const m = txt.match(/matches_\d+\((.*)\)/);
-    if (!m) return [];
-    
-    const js = JSON.parse(m[1]);
-    if (js.code !== 200) return [];
 
-    const now = Math.floor(Date.now() / 1000);
-    const matchDur = 2.5 * 3600; // 2.5 hours
+    const text = await res.text();
+    // JSONP format: matches_20251125({...}) -> extract JSON
+    const match = text.match(/matches_\d+\((.*)\)/);
+    if (!match) return [];
+
+    const json = JSON.parse(match[1]);
+    if (json.code !== 200 || !json.data) return [];
+
+    // Format Data
+    const now = Date.now();
     const results = [];
 
-    for (const it of js.data) {
-      const mt = Math.floor(it.matchTime / 1000);
-      let status;
-      if (now >= mt && now <= mt + matchDur) status = "live";
-      else if (now > mt + matchDur) status = "finished";
-      else status = "upcoming";
+    for (const item of json.data) {
+      const matchTimeMs = item.matchTime;
+      const matchEndTimeMs = matchTimeMs + (3 * 60 * 60 * 1000); // ~3 hours duration
 
+      let status = "upcoming";
+      if (now >= matchTimeMs && now <= matchEndTimeMs) status = "live";
+      else if (now > matchEndTimeMs) status = "finished";
+
+      // Live ချိန်မှသာ Link ရှာမယ်
       const servers = [];
-      // Fetch stream links only if LIVE
-      if (status === "live" && it.anchors) {
-        for (const a of it.anchors) {
-          const room = a.anchor.roomNum;
-          const { m3u8, hdM3u8 } = await fetchServerURL(room);
-          if (m3u8) servers.push({ label: "SD", url: m3u8 });
-          if (hdM3u8) servers.push({ label: "HD", url: hdM3u8 });
+      if (status === "live" && item.anchors) {
+        for (const anchor of item.anchors) {
+           const links = await fetchStreamLinks(anchor.anchor.roomNum);
+           if (links.m3u8) servers.push({ name: "Soco SD", stream_url: links.m3u8 });
+           if (links.hdM3u8) servers.push({ name: "Soco HD", stream_url: links.hdM3u8 });
         }
       }
 
       results.push({
-        league: it.leagueName,
-        home: it.homeName,
-        away: it.awayName,
-        home_icon: it.homeIcon,
-        away_icon: it.awayIcon,
-        score: (it.homeScore !== undefined) ? `${it.homeScore} - ${it.awayScore}` : "VS",
-        time: new Date(it.matchTime).toLocaleTimeString('en-US', { timeZone: 'Asia/Yangon', hour: '2-digit', minute: '2-digit', hour12: true }),
-        status: status,
-        streams: servers
+        match_time: Math.floor(matchTimeMs / 1000),
+        match_time_str: new Date(matchTimeMs).toLocaleTimeString('en-US', { timeZone: 'Asia/Yangon', hour: '2-digit', minute: '2-digit', hour12: true }),
+        raw_time: matchTimeMs,
+        match_status: status,
+        home_team_name: item.homeName,
+        away_team_name: item.awayName,
+        league_name: item.leagueName,
+        match_score: (item.homeScore !== undefined) ? `${item.homeScore} - ${item.awayScore}` : "VS",
+        servers: servers
       });
     }
     return results;
+
   } catch (e) {
-    console.error("Fetch error:", e);
+    console.error("Fetch Match Error:", e);
     return [];
   }
+}
+
+// 2. Fetch Stream Links (Detail API)
+async function fetchStreamLinks(roomNum: any) {
+  try {
+    const res = await fetch(`https://json.vnres.co/room/${roomNum}/detail.json`, {
+        headers: {
+            "User-Agent": "Mozilla/5.0",
+            "Referer": "https://socolivev.co/"
+        }
+    });
+    const text = await res.text();
+    const match = text.match(/detail\((.*)\)/);
+    if (match) {
+      const json = JSON.parse(match[1]);
+      if (json.data && json.data.stream) {
+        return { 
+            m3u8: json.data.stream.m3u8, 
+            hdM3u8: json.data.stream.hdM3u8 
+        };
+      }
+    }
+  } catch (e) { /* ignore */ }
+  return { m3u8: null, hdM3u8: null };
 }
