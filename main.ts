@@ -8,6 +8,11 @@ const API_USER_AGENT =
   Deno.env.get("API_USER_AGENT") ||
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36";
 
+// ====== Developer Contact Info ======
+const DEV_CONTACT_URL = Deno.env.get("DEV_CONTACT_URL") || "https://t.me/yourusername";
+const DEV_PROFILE_IMG = Deno.env.get("DEV_PROFILE_IMG") || "https://ui-avatars.com/api/?name=Dev&background=d97706&color=fff&size=128";
+const DEV_DISPLAY_NAME = Deno.env.get("DEV_DISPLAY_NAME") || "Developer";
+
 // ====== SECURITY: Rate Limiter ======
 const rateLimitMap = new Map<string, { count: number; resetTime: number }>();
 const RATE_LIMIT_WINDOW = 60_000;
@@ -152,7 +157,6 @@ async function handleStreamProxy(req: Request, url: URL): Promise<Response> {
     return new Response("Missing url parameter", { status: 400, headers: securityHeaders() });
   }
 
-  // Validate URL
   if (!/^https?:\/\//i.test(streamUrl)) {
     return new Response("Invalid URL", { status: 400, headers: securityHeaders() });
   }
@@ -177,16 +181,13 @@ async function handleStreamProxy(req: Request, url: URL): Promise<Response> {
     const contentType = proxyRes.headers.get("content-type") || "";
     const body = proxyRes.body;
 
-    // For m3u8 playlists, rewrite internal URLs to also go through proxy
     if (streamUrl.endsWith(".m3u8") || contentType.includes("mpegurl") || contentType.includes("m3u8")) {
       const text = await proxyRes.text();
-      // Get base URL for resolving relative paths
       const baseUrl = streamUrl.substring(0, streamUrl.lastIndexOf("/") + 1);
-      
+
       const rewritten = text.split("\n").map((line: string) => {
         const trimmed = line.trim();
         if (trimmed && !trimmed.startsWith("#")) {
-          // This is a URL line (segment or sub-playlist)
           let absoluteUrl: string;
           if (/^https?:\/\//i.test(trimmed)) {
             absoluteUrl = trimmed;
@@ -209,7 +210,6 @@ async function handleStreamProxy(req: Request, url: URL): Promise<Response> {
       });
     }
 
-    // For .ts segments, stream them through
     const resHeaders: Record<string, string> = {
       "Access-Control-Allow-Origin": "*",
       "Cache-Control": "public, max-age=10",
@@ -235,7 +235,6 @@ serve(async (req) => {
   const url = new URL(req.url);
   const clientIP = getClientIP(req);
 
-  // --- SECURITY: Rate Limiting ---
   const { limited, blocked } = isRateLimited(clientIP);
   if (blocked) {
     return new Response(
@@ -264,12 +263,10 @@ serve(async (req) => {
     );
   }
 
-  // --- SECURITY: Suspicious Request Detection ---
   if (isSuspiciousRequest(req)) {
     return new Response("Not Found", { status: 404, headers: securityHeaders() });
   }
 
-  // --- SECURITY: Method validation ---
   if (req.method !== "GET") {
     return new Response("Method Not Allowed", {
       status: 405,
@@ -352,6 +349,10 @@ serve(async (req) => {
 
 // ====== FRONTEND HTML ======
 function getHTML(): string {
+  const safeDevUrl = sanitizeUrl(DEV_CONTACT_URL) || "#";
+  const safeDevImg = sanitizeUrl(DEV_PROFILE_IMG) || "";
+  const safeDevName = sanitizeText(DEV_DISPLAY_NAME, 50) || "Developer";
+
   return `<!DOCTYPE html>
 <html lang="my">
 <head>
@@ -401,6 +402,36 @@ function getHTML(): string {
       font-weight: 500;
       letter-spacing: 2px;
       text-transform: uppercase;
+    }
+
+    .dev-contact-link {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 4px 12px;
+      border-radius: 24px;
+      background: linear-gradient(135deg, rgba(217,119,6,0.1), rgba(180,83,9,0.05));
+      border: 1px solid rgba(217,119,6,0.2);
+      text-decoration: none;
+      transition: all 0.3s;
+    }
+    .dev-contact-link:hover {
+      background: linear-gradient(135deg, rgba(217,119,6,0.18), rgba(180,83,9,0.1));
+      border-color: rgba(217,119,6,0.35);
+      transform: translateY(-1px);
+      box-shadow: 0 4px 12px rgba(217,119,6,0.15);
+    }
+    .dev-avatar {
+      width: 28px;
+      height: 28px;
+      border-radius: 50%;
+      object-fit: cover;
+      border: 2px solid rgba(217,119,6,0.3);
+    }
+    .dev-name {
+      font-size: 11px;
+      font-weight: 700;
+      color: #b45309;
     }
 
     .live-dot {
@@ -641,7 +672,6 @@ function getHTML(): string {
 
     .bottom-safe { height: 100px; }
 
-    /* Player error overlay */
     .player-error {
       position: absolute;
       top: 0; left: 0; right: 0; bottom: 0;
@@ -665,7 +695,6 @@ function getHTML(): string {
       cursor: pointer;
     }
 
-    /* Loading overlay for player */
     .player-loading {
       position: absolute;
       top: 0; left: 0; right: 0; bottom: 0;
@@ -677,6 +706,46 @@ function getHTML(): string {
     }
     .player-loading .loading-spinner {
       border-top-color: #facc15;
+    }
+
+    .day-separator {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin: 16px 0 10px 0;
+    }
+    .day-separator-line {
+      flex: 1;
+      height: 1px;
+      background: rgba(0,0,0,0.08);
+    }
+    .day-separator-label {
+      font-size: 11px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      padding: 4px 14px;
+      border-radius: 20px;
+    }
+    .day-today {
+      background: rgba(99,102,241,0.1);
+      color: #6366f1;
+      border: 1px solid rgba(99,102,241,0.2);
+    }
+    .day-tomorrow {
+      background: rgba(16,185,129,0.1);
+      color: #059669;
+      border: 1px solid rgba(16,185,129,0.2);
+    }
+    .day-yesterday {
+      background: rgba(100,116,139,0.08);
+      color: #64748b;
+      border: 1px solid rgba(100,116,139,0.15);
+    }
+    .day-other {
+      background: rgba(0,0,0,0.04);
+      color: #64748b;
+      border: 1px solid rgba(0,0,0,0.08);
     }
   </style>
 </head>
@@ -691,9 +760,15 @@ function getHTML(): string {
             <h1 class="header-title text-xl">All Sports Live</h1>
             <p class="header-subtitle mt-0.5">Premium Sports Streaming</p>
           </div>
-          <div class="text-right">
-            <div class="text-[10px] text-slate-400 font-medium">Myanmar Time</div>
-            <div id="clock" class="text-sm font-bold text-slate-600 font-mono tracking-wide">--:--</div>
+          <div class="flex items-center gap-3">
+            <a href="${safeDevUrl}" target="_blank" rel="noopener noreferrer" title="Contact ${safeDevName}" class="dev-contact-link">
+              <img src="${safeDevImg}" alt="${safeDevName}" class="dev-avatar" onerror="this.style.display='none'">
+              <span class="dev-name">${safeDevName}</span>
+            </a>
+            <div class="text-right">
+              <div class="text-[10px] text-slate-400 font-medium">Myanmar Time</div>
+              <div id="clock" class="text-sm font-bold text-slate-600 font-mono tracking-wide">--:--</div>
+            </div>
           </div>
         </div>
       </div>
@@ -840,6 +915,13 @@ function getHTML(): string {
       return fallback;
     }
 
+    function getDaySeparatorClass(day) {
+      if (day === "Today") return "day-today";
+      if (day === "Tomorrow") return "day-tomorrow";
+      if (day === "Yesterday") return "day-yesterday";
+      return "day-other";
+    }
+
     function renderMatches() {
       var list = document.getElementById("match-list");
       var filtered = allData;
@@ -855,9 +937,23 @@ function getHTML(): string {
 
       list.innerHTML = "";
 
+      var lastDay = null;
+
       filtered.forEach(function(m, idx) {
         var isLive = m.match_status === "live";
         var isFinished = m.match_status === "finished";
+
+        // Day separator
+        var matchDay = m.match_day || "Today";
+        if (matchDay !== lastDay) {
+          lastDay = matchDay;
+          var sep = document.createElement("div");
+          sep.className = "day-separator";
+          sep.innerHTML = '<div class="day-separator-line"></div>' +
+            '<span class="day-separator-label ' + getDaySeparatorClass(matchDay) + '">' + escapeHtml(matchDay) + '</span>' +
+            '<div class="day-separator-line"></div>';
+          list.appendChild(sep);
+        }
 
         var card = document.createElement("div");
         card.className = isLive ? "card card-live p-5" : "card p-5";
@@ -876,10 +972,12 @@ function getHTML(): string {
           statusBadge.innerHTML = '<span class="live-dot"></span>LIVE ' + escapeHtml(m.match_time || "");
         } else if (isFinished) {
           statusBadge.className = "status-ft";
-          statusBadge.textContent = "FT";
+          var ftDayLabel = m.match_day && m.match_day !== "Today" ? m.match_day + " · " : "";
+          statusBadge.textContent = ftDayLabel + "FT";
         } else {
           statusBadge.className = "status-upcoming";
-          statusBadge.textContent = m.match_time || "";
+          var dayLabel = m.match_day && m.match_day !== "Today" ? m.match_day + " · " : "";
+          statusBadge.textContent = dayLabel + (m.match_time || "");
         }
 
         headerRow.appendChild(leagueBadge);
@@ -974,7 +1072,6 @@ function getHTML(): string {
     }
 
     function showPlayerError(message) {
-      // Remove existing error overlay if any
       var existing = document.getElementById("player-error-overlay");
       if (existing) existing.remove();
 
@@ -1008,7 +1105,6 @@ function getHTML(): string {
 
       currentStreamUrl = originalUrl;
 
-      // Use proxy to avoid CORS / CSP issues
       var proxyUrl = "/api/stream-proxy?url=" + encodeURIComponent(originalUrl);
 
       document.getElementById("player-container").classList.remove("hidden");
@@ -1032,7 +1128,6 @@ function getHTML(): string {
           maxBufferLength: 30,
           maxMaxBufferLength: 60,
           xhrSetup: function(xhr, url) {
-            // If it's already a proxy URL, use as-is; otherwise proxy it
             if (url.indexOf("/api/stream-proxy") === -1 && /^https?:\\/\\//i.test(url)) {
               xhr.open("GET", "/api/stream-proxy?url=" + encodeURIComponent(url), true);
             }
@@ -1055,11 +1150,9 @@ function getHTML(): string {
           if (data.fatal) {
             showPlayerLoading(false);
             if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
-              // Try recovery once
               console.warn("HLS network error, attempting recovery...");
               hls.startLoad();
               setTimeout(function() {
-                // If still not playing after 10 seconds, show error
                 if (vid.paused && vid.readyState < 3) {
                   showPlayerError("Stream connection failed. Please try another server.");
                 }
@@ -1075,7 +1168,6 @@ function getHTML(): string {
           }
         });
       } else if (vid.canPlayType("application/vnd.apple.mpegurl")) {
-        // Native HLS (Safari / iOS)
         vid.src = proxyUrl;
         vid.addEventListener("loadeddata", function onLoaded() {
           showPlayerLoading(false);
@@ -1221,6 +1313,50 @@ async function fetchMatches(date: string) {
         matchScore = `${hs} - ${as}`;
       }
 
+      // ---- Compute match_day label ----
+      const matchDateStr = new Intl.DateTimeFormat("en-CA", {
+        timeZone: "Asia/Yangon",
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+      }).format(new Date(mt));
+
+      const todayDateStr = new Intl.DateTimeFormat("en-CA", {
+        timeZone: "Asia/Yangon",
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+      }).format(new Date());
+
+      const tomorrowD = new Date();
+      tomorrowD.setDate(tomorrowD.getDate() + 1);
+      const tomorrowDateStr = new Intl.DateTimeFormat("en-CA", {
+        timeZone: "Asia/Yangon",
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+      }).format(tomorrowD);
+
+      const yesterdayD = new Date();
+      yesterdayD.setDate(yesterdayD.getDate() - 1);
+      const yesterdayDateStr = new Intl.DateTimeFormat("en-CA", {
+        timeZone: "Asia/Yangon",
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+      }).format(yesterdayD);
+
+      let matchDay: string;
+      if (matchDateStr === todayDateStr) {
+        matchDay = "Today";
+      } else if (matchDateStr === tomorrowDateStr) {
+        matchDay = "Tomorrow";
+      } else if (matchDateStr === yesterdayDateStr) {
+        matchDay = "Yesterday";
+      } else {
+        matchDay = matchDateStr;
+      }
+
       results.push({
         match_time: new Date(mt).toLocaleTimeString("en-US", {
           timeZone: "Asia/Yangon",
@@ -1228,6 +1364,7 @@ async function fetchMatches(date: string) {
           minute: "2-digit",
           hour12: true,
         }),
+        match_day: matchDay,
         match_status: status,
         home_team_name: homeTeamName,
         away_team_name: awayTeamName,
