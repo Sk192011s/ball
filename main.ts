@@ -1,13 +1,18 @@
-import { serve } from "https://deno.land/std@0.208.0/http/server.ts";  
+import { serve } from "https://deno.land/std@0.208.0/http/server.ts";
+
+// ====== Environment Variables ======
 const MATCH_API_BASE = Deno.env.get("MATCH_API_BASE") || "";
 const ROOM_API_BASE = Deno.env.get("ROOM_API_BASE") || "";
 const API_REFERER = Deno.env.get("API_REFERER") || "";
 const API_USER_AGENT = Deno.env.get("API_USER_AGENT") || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36";
+
+// ====== SECURITY: Rate Limiter ======
 const rateLimitMap = new Map<string, { count: number; resetTime: number }>();
-const RATE_LIMIT_WINDOW = 60_000; 
-const RATE_LIMIT_MAX = 60; 
-const BLOCK_THRESHOLD = 200; 
-const blockedIPs = new Map<string, number>(); 
+const RATE_LIMIT_WINDOW = 60_000; // 1 minute
+const RATE_LIMIT_MAX = 60; // max 60 requests per minute per IP
+const BLOCK_THRESHOLD = 200; // block if > 200 requests in window
+const blockedIPs = new Map<string, number>(); // IP -> block expiry time
+
 function getClientIP(req: Request): string {
   return (
     req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ||
@@ -16,29 +21,40 @@ function getClientIP(req: Request): string {
     "unknown"
   );
 }
+
 function isRateLimited(ip: string): { limited: boolean; blocked: boolean } {
   const now = Date.now();
+
+  // Check if IP is blocked
   const blockExpiry = blockedIPs.get(ip);
   if (blockExpiry && now < blockExpiry) {
     return { limited: true, blocked: true };
   } else if (blockExpiry) {
     blockedIPs.delete(ip);
   }
+
   const entry = rateLimitMap.get(ip);
   if (!entry || now > entry.resetTime) {
     rateLimitMap.set(ip, { count: 1, resetTime: now + RATE_LIMIT_WINDOW });
     return { limited: false, blocked: false };
   }
+
   entry.count++;
+
+  // Auto-block if way too many requests (bot behavior)
   if (entry.count > BLOCK_THRESHOLD) {
-    blockedIPs.set(ip, now + 10 * 60_000); 
+    blockedIPs.set(ip, now + 10 * 60_000); // Block for 10 minutes
     return { limited: true, blocked: true };
   }
+
   if (entry.count > RATE_LIMIT_MAX) {
     return { limited: true, blocked: false };
   }
+
   return { limited: false, blocked: false };
 }
+
+// Clean up stale entries periodically
 setInterval(() => {
   const now = Date.now();
   for (const [ip, entry] of rateLimitMap) {
@@ -48,21 +64,31 @@ setInterval(() => {
     if (now > expiry) blockedIPs.delete(ip);
   }
 }, 5 * 60_000);
+
+// ====== SECURITY: Suspicious Request Detection ======
 function isSuspiciousRequest(req: Request): boolean {
   const ua = req.headers.get("user-agent") || "";
   const url = new URL(req.url);
+
+  // Block empty user agents (common in bots/scripts)
   if (!ua || ua.length < 10) return true;
+
+  // Block known malicious bot patterns
   const botPatterns = [
     /sqlmap/i, /nikto/i, /nmap/i, /masscan/i,
     /dirbuster/i, /gobuster/i, /wfuzz/i, /hydra/i,
     /burpsuite/i, /nessus/i, /openvas/i, /acunetix/i,
     /zgrab/i, /nuclei/i, /httpx/i, /crawl.*bot/i,
-    /python-requests/i, /go-http-client/i, /curl\
-    /wget\
+    /python-requests/i, /go-http-client/i, /curl\//i,
+    /wget\//i, /scrapy/i, /phantomjs/i, /headless/i,
   ];
   if (botPatterns.some(p => p.test(ua))) return true;
+
+  // Block path traversal attempts
   const path = url.pathname;
-  if (path.includes("..") || path.includes("
+  if (path.includes("..") || path.includes("//") || path.includes("\\")) return true;
+
+  // Block common vulnerability probing paths
   const maliciousPaths = [
     /\.env/i, /\.git/i, /wp-admin/i, /wp-login/i,
     /phpmyadmin/i, /admin/i, /\.php/i, /\.asp/i,
@@ -70,6 +96,8 @@ function isSuspiciousRequest(req: Request): boolean {
     /\.sql/i, /backup/i, /\.bak/i, /\.log/i,
   ];
   if (maliciousPaths.some(p => p.test(path))) return true;
+
+  // Block SQL injection patterns in query strings
   const query = url.search;
   const sqlPatterns = [
     /union.*select/i, /or\s+1\s*=\s*1/i, /drop\s+table/i,
@@ -77,8 +105,11 @@ function isSuspiciousRequest(req: Request): boolean {
     /<iframe/i, /javascript:/i, /onerror/i, /onload/i,
   ];
   if (sqlPatterns.some(p => p.test(query))) return true;
+
   return false;
 }
+
+// ====== SECURITY: Response Headers ======
 function securityHeaders(): Record<string, string> {
   return {
     "X-Content-Type-Options": "nosniff",
@@ -97,9 +128,12 @@ function securityHeaders(): Record<string, string> {
     "Strict-Transport-Security": "max-age=31536000; includeSubDomains",
   };
 }
+
 serve(async (req) => {
   const url = new URL(req.url);
   const clientIP = getClientIP(req);
+
+  // --- SECURITY: Rate Limiting ---
   const { limited, blocked } = isRateLimited(clientIP);
   if (blocked) {
     return new Response(
@@ -119,15 +153,22 @@ serve(async (req) => {
       }
     );
   }
+
+  // --- SECURITY: Suspicious Request Detection ---
   if (isSuspiciousRequest(req)) {
+    // Return 404 to not reveal we detected them
     return new Response("Not Found", { status: 404, headers: securityHeaders() });
   }
+
+  // --- SECURITY: Method validation ---
   if (req.method !== "GET") {
     return new Response("Method Not Allowed", {
       status: 405,
       headers: { Allow: "GET", ...securityHeaders() },
     });
   }
+
+  // --- 1. API ROUTE (Backend) ---
   if (url.pathname === "/api/matches") {
     try {
       const getVNDate = (offset: number) => {
@@ -142,12 +183,15 @@ serve(async (req) => {
           .format(d)
           .replace(/-/g, "");
       };
+
       const dates = [getVNDate(-1), getVNDate(0), getVNDate(1)];
+
       let allMatches: any[] = [];
       for (const d of dates) {
         const matches = await fetchMatches(d);
         allMatches = allMatches.concat(matches);
       }
+
       allMatches.sort((a, b) => {
         if (a.match_status === "live" && b.match_status !== "live") return -1;
         if (a.match_status !== "live" && b.match_status === "live") return 1;
@@ -155,6 +199,7 @@ serve(async (req) => {
         if (a.match_status === "finished" && b.match_status === "upcoming") return 1;
         return 0;
       });
+
       return new Response(JSON.stringify(allMatches), {
         headers: {
           "Content-Type": "application/json",
@@ -174,13 +219,18 @@ serve(async (req) => {
       });
     }
   }
+
+  // --- 2. FRONTEND UI (HTML) ---
   if (url.pathname === "/") {
     return new Response(getHTML(), {
       headers: { "Content-Type": "text/html; charset=utf-8", ...securityHeaders() },
     });
   }
+
   return new Response("Not Found", { status: 404, headers: securityHeaders() });
 });
+
+// ====== FRONTEND HTML — PREMIUM BRIGHT UI ======
 function getHTML(): string {
   return `<!DOCTYPE html>
 <html lang="my">
@@ -193,6 +243,7 @@ function getHTML(): string {
   <link href="https://fonts.googleapis.com/css2?family=Padauk:wght@400;700&family=Inter:wght@300;400;500;600;700;800;900&display=swap" rel="stylesheet">
   <style>
     * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+
     body {
       background: #0b0f1a;
       color: #f1f5f9;
@@ -201,6 +252,8 @@ function getHTML(): string {
       min-height: 100vh;
       overflow-x: hidden;
     }
+
+    /* Ambient background glow */
     body::before {
       content: '';
       position: fixed;
@@ -223,10 +276,13 @@ function getHTML(): string {
       pointer-events: none;
       z-index: 0;
     }
+
     .app-container {
       position: relative;
       z-index: 1;
     }
+
+    /* ===== HEADER ===== */
     .premium-header {
       background: linear-gradient(135deg, rgba(15,23,42,0.95) 0%, rgba(30,41,59,0.9) 100%);
       border-bottom: 1px solid rgba(255,255,255,0.06);
@@ -251,6 +307,8 @@ function getHTML(): string {
       letter-spacing: 2px;
       text-transform: uppercase;
     }
+
+    /* ===== LIVE DOT ===== */
     .live-dot {
       width: 8px; height: 8px;
       background: #ef4444;
@@ -263,6 +321,8 @@ function getHTML(): string {
       0%, 100% { opacity: 1; transform: scale(1); }
       50% { opacity: 0.5; transform: scale(0.7); }
     }
+
+    /* ===== CARDS ===== */
     .card {
       background: linear-gradient(145deg, rgba(30,41,59,0.7), rgba(15,23,42,0.8));
       border: 1px solid rgba(255,255,255,0.06);
@@ -296,6 +356,8 @@ function getHTML(): string {
       border-color: rgba(239,68,68,0.35);
       box-shadow: 0 0 40px rgba(239,68,68,0.1);
     }
+
+    /* ===== TEAM LOGOS ===== */
     .team-logo {
       width: 48px; height: 48px;
       border-radius: 50%;
@@ -316,6 +378,8 @@ function getHTML(): string {
       font-size: 18px;
       border: 2px solid rgba(255,255,255,0.08);
     }
+
+    /* ===== BUTTONS ===== */
     .btn-hd {
       background: linear-gradient(135deg, #ef4444, #dc2626);
       box-shadow: 0 4px 15px rgba(239,68,68,0.25);
@@ -333,6 +397,7 @@ function getHTML(): string {
     .btn-hd:hover::before { left: 100%; }
     .btn-hd:hover { box-shadow: 0 6px 25px rgba(239,68,68,0.4); transform: translateY(-1px); }
     .btn-hd:active { transform: translateY(0); }
+
     .btn-sd {
       background: linear-gradient(135deg, #6366f1, #4f46e5);
       box-shadow: 0 4px 15px rgba(99,102,241,0.25);
@@ -350,6 +415,8 @@ function getHTML(): string {
     .btn-sd:hover::before { left: 100%; }
     .btn-sd:hover { box-shadow: 0 6px 25px rgba(99,102,241,0.4); transform: translateY(-1px); }
     .btn-sd:active { transform: translateY(0); }
+
+    /* ===== SCORE BOX ===== */
     .score-box {
       background: rgba(0,0,0,0.5);
       border: 1px solid rgba(255,255,255,0.06);
@@ -357,6 +424,8 @@ function getHTML(): string {
       padding: 6px 16px;
       min-width: 80px;
     }
+
+    /* ===== LEAGUE BADGE ===== */
     .league-badge {
       background: linear-gradient(135deg, rgba(250,204,21,0.08), rgba(245,158,11,0.05));
       border: 1px solid rgba(250,204,21,0.15);
@@ -364,6 +433,8 @@ function getHTML(): string {
       padding: 4px 12px;
       font-weight: 600;
     }
+
+    /* ===== TABS ===== */
     .tab-btn {
       padding: 10px 22px;
       border-radius: 24px;
@@ -390,6 +461,8 @@ function getHTML(): string {
       color: #e2e8f0;
       border-color: rgba(255,255,255,0.15);
     }
+
+    /* ===== STAT PILLS ===== */
     .stat-pill {
       background: rgba(255,255,255,0.04);
       border: 1px solid rgba(255,255,255,0.06);
@@ -406,6 +479,8 @@ function getHTML(): string {
       border-radius: 50%;
       display: inline-block;
     }
+
+    /* ===== LOADING ===== */
     .loading-spinner {
       width: 44px; height: 44px;
       border: 3px solid rgba(255,255,255,0.06);
@@ -415,6 +490,8 @@ function getHTML(): string {
       animation: spin 0.7s linear infinite;
     }
     @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* ===== PLAYER ===== */
     .player-wrapper {
       border-radius: 20px;
       overflow: hidden;
@@ -429,10 +506,14 @@ function getHTML(): string {
     .close-btn:hover {
       background: linear-gradient(135deg, #dc2626, #991b1b);
     }
+
+    /* ===== SCROLLBAR ===== */
     ::-webkit-scrollbar { width: 3px; height: 3px; }
     ::-webkit-scrollbar-track { background: transparent; }
     ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.08); border-radius: 4px; }
     ::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.15); }
+
+    /* ===== PAGE LOAD ANIMATION ===== */
     @keyframes fadeUp {
       from { opacity: 0; transform: translateY(12px); }
       to { opacity: 1; transform: translateY(0); }
@@ -441,6 +522,8 @@ function getHTML(): string {
     .fade-up-delay-1 { animation-delay: 0.1s; opacity: 0; }
     .fade-up-delay-2 { animation-delay: 0.2s; opacity: 0; }
     .fade-up-delay-3 { animation-delay: 0.3s; opacity: 0; }
+
+    /* ===== NO MATCHES ===== */
     .empty-state {
       text-align: center;
       padding: 60px 20px;
@@ -450,10 +533,14 @@ function getHTML(): string {
       margin-bottom: 16px;
       opacity: 0.5;
     }
+
+    /* ===== MATCH DIVIDER ===== */
     .match-divider {
       height: 1px;
       background: linear-gradient(90deg, transparent, rgba(255,255,255,0.04), transparent);
     }
+
+    /* ===== STATUS BADGES ===== */
     .status-live {
       background: rgba(239,68,68,0.1);
       border: 1px solid rgba(239,68,68,0.2);
@@ -484,11 +571,14 @@ function getHTML(): string {
       font-size: 10px;
       font-weight: 600;
     }
+
+    /* ===== FOOTER SPACING ===== */
     .bottom-safe { height: 100px; }
   </style>
 </head>
 <body>
   <div class="app-container">
+
     <!-- Premium Header -->
     <div class="premium-header">
       <div class="max-w-md mx-auto px-5 py-4">
@@ -504,7 +594,9 @@ function getHTML(): string {
         </div>
       </div>
     </div>
+
     <div class="max-w-md mx-auto px-4 pt-5 pb-4">
+
       <!-- Filter Tabs -->
       <div class="flex gap-2 mb-4 overflow-x-auto pb-1 fade-up fade-up-delay-1" id="tabs">
         <button class="tab-btn active" onclick="filterMatches('all')">All Matches</button>
@@ -512,6 +604,7 @@ function getHTML(): string {
         <button class="tab-btn" onclick="filterMatches('upcoming')">⏳ Upcoming</button>
         <button class="tab-btn" onclick="filterMatches('finished')">✅ Finished</button>
       </div>
+
       <!-- Stats Bar -->
       <div class="flex gap-2 justify-center mb-5 fade-up fade-up-delay-2" id="stats-bar">
         <span class="stat-pill text-slate-400">
@@ -527,6 +620,7 @@ function getHTML(): string {
           <span id="stat-upcoming">Soon: —</span>
         </span>
       </div>
+
       <!-- Video Player -->
       <div id="player-container" class="hidden sticky top-[68px] z-50 mb-5 player-wrapper">
         <div class="bg-black relative">
@@ -536,20 +630,26 @@ function getHTML(): string {
           ✕ ပိတ်မည် (Close Player)
         </button>
       </div>
+
       <!-- Loading -->
       <div id="loading" class="flex flex-col items-center py-20 fade-up fade-up-delay-3">
         <div class="loading-spinner mb-4"></div>
         <span class="text-slate-500 text-sm font-medium">Loading matches...</span>
       </div>
+
       <!-- Match List -->
       <div id="match-list" class="space-y-3"></div>
+
       <div class="bottom-safe"></div>
     </div>
   </div>
+
   <script>
     let allData = [];
     let currentFilter = 'all';
     let currentHls = null;
+
+    // Live clock
     function updateClock() {
       const now = new Date();
       const mmTime = now.toLocaleTimeString('en-US', {
@@ -560,6 +660,7 @@ function getHTML(): string {
     }
     updateClock();
     setInterval(updateClock, 1000);
+
     async function load() {
       try {
         const res = await fetch('/api/matches');
@@ -575,6 +676,7 @@ function getHTML(): string {
           '<div class="empty-state"><div class="empty-state-icon">⚠️</div><div class="text-red-400 text-sm font-medium">' + e.message + '</div><div class="text-slate-600 text-xs mt-2">Pull to refresh or try again later</div></div>';
       }
     }
+
     function updateStats() {
       const live = allData.filter(m => m.match_status === 'live').length;
       const upcoming = allData.filter(m => m.match_status === 'upcoming').length;
@@ -582,12 +684,14 @@ function getHTML(): string {
       document.getElementById('stat-live').textContent = 'Live: ' + live;
       document.getElementById('stat-upcoming').textContent = 'Soon: ' + upcoming;
     }
+
     function filterMatches(type) {
       currentFilter = type;
       document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
       event.target.classList.add('active');
       renderMatches();
     }
+
     function getLogoHTML(url, teamName) {
       if (url) {
         return '<img src="' + url + '" alt="" class="team-logo" loading="lazy" onerror="this.style.display=\\'none\\';this.nextElementSibling.style.display=\\'flex\\';">' +
@@ -595,26 +699,31 @@ function getHTML(): string {
       }
       return '<div class="team-logo-fallback">⚽</div>';
     }
+
     function escapeHtml(str) {
       const div = document.createElement('div');
       div.textContent = str;
       return div.innerHTML;
     }
+
     function renderMatches() {
       const list = document.getElementById('match-list');
       let filtered = allData;
       if (currentFilter !== 'all') {
         filtered = allData.filter(m => m.match_status === currentFilter);
       }
+
       if (filtered.length === 0) {
         list.innerHTML = '<div class="empty-state"><div class="empty-state-icon">📭</div><div class="text-slate-500 text-sm font-medium">ပွဲစဉ်များ မရှိသေးပါ</div><div class="text-slate-600 text-xs mt-1">No matches found</div></div>';
         return;
       }
+
       let html = '';
       filtered.forEach((m, idx) => {
         const isLive = m.match_status === 'live';
         const isFinished = m.match_status === 'finished';
         const cardClass = isLive ? 'card card-live' : 'card';
+
         let statusHTML = '';
         if (isLive) {
           statusHTML = '<span class="status-live"><span class="live-dot"></span>LIVE ' + escapeHtml(m.match_time || '') + '</span>';
@@ -623,6 +732,7 @@ function getHTML(): string {
         } else {
           statusHTML = '<span class="status-upcoming">' + escapeHtml(m.match_time) + '</span>';
         }
+
         let btns = '';
         if (m.servers && m.servers.length > 0) {
           m.servers.forEach(s => {
@@ -638,11 +748,14 @@ function getHTML(): string {
         } else {
           btns = '<span class="text-[11px] text-slate-600 font-medium">Not started yet</span>';
         }
+
         const homeLogo = getLogoHTML(m.home_team_logo, m.home_team_name);
         const awayLogo = getLogoHTML(m.away_team_logo, m.away_team_name);
+
         const scoreDisplay = m.match_score
           ? '<div class="score-box text-center"><span class="text-xl font-black tracking-wider" style="color:#facc15; text-shadow: 0 0 20px rgba(250,204,21,0.3);">' + escapeHtml(m.match_score) + '</span></div>'
           : '<div class="score-box text-center"><span class="text-sm font-bold text-slate-500">VS</span></div>';
+
         html += '<div class="' + cardClass + ' p-5" style="animation: fadeUp 0.4s ease-out ' + (idx * 0.05) + 's both;">' +
           '<div class="flex justify-between items-center mb-4">' +
             '<span class="league-badge text-[10px] text-amber-400/90 truncate max-w-[60%]">' + escapeHtml(m.league_name) + '</span>' +
@@ -668,14 +781,17 @@ function getHTML(): string {
       });
       list.innerHTML = html;
     }
+
     function play(encodedUrl) {
       const url = decodeURIComponent(encodedUrl);
       document.getElementById('player-container').classList.remove('hidden');
       const vid = document.getElementById('video');
+
       if (currentHls) {
         currentHls.destroy();
         currentHls = null;
       }
+
       if (Hls.isSupported()) {
         const hls = new Hls({
           enableWorker: true,
@@ -703,6 +819,7 @@ function getHTML(): string {
       }
       window.scrollTo({ top: 0, behavior: 'smooth' });
     }
+
     function closePlayer() {
       const vid = document.getElementById('video');
       vid.pause();
@@ -714,21 +831,29 @@ function getHTML(): string {
       }
       document.getElementById('player-container').classList.add('hidden');
     }
+
+    // Initial load
     load();
+    // Auto-refresh every 60 seconds
     setInterval(load, 60000);
   </script>
 </body>
 </html>`;
 }
+
+// ====== BACKEND LOGIC ======
+
 async function fetchServerURL(roomNum: any) {
   try {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 8000); 
+    const timeout = setTimeout(() => controller.abort(), 8000); // 8s timeout
+
     const res = await fetch(`${ROOM_API_BASE}/room/${roomNum}/detail.json`, {
       headers: { "User-Agent": API_USER_AGENT, Referer: API_REFERER },
       signal: controller.signal,
     });
     clearTimeout(timeout);
+
     const txt = await res.text();
     const m = txt.match(/detail\((.*)\)/);
     if (m) {
@@ -738,36 +863,50 @@ async function fetchServerURL(roomNum: any) {
       }
     }
   } catch (_e) {
+    /* ignore */
   }
   return { m3u8: null, hdM3u8: null };
 }
+
 async function fetchMatches(date: string) {
+  // Validate date format (YYYYMMDD)
   if (!/^\d{8}$/.test(date)) return [];
+
   try {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 10000); 
+    const timeout = setTimeout(() => controller.abort(), 10000); // 10s timeout
+
     const res = await fetch(`${MATCH_API_BASE}/match/matches_${date}.json`, {
       headers: { "User-Agent": API_USER_AGENT, Referer: API_REFERER },
       signal: controller.signal,
     });
     clearTimeout(timeout);
+
     const txt = await res.text();
     const m = txt.match(/matches_\d+\((.*)\)/);
     if (!m) return [];
+
     const js = JSON.parse(m[1]);
     if (js.code !== 200) return [];
+
     const now = Date.now();
     const results = [];
+
     for (const it of js.data) {
       const mt = it.matchTime;
+
+      // Basic data validation
       if (!mt || typeof mt !== "number") continue;
+
       let status: string;
       if (now >= mt && now <= mt + 3 * 60 * 60 * 1000) status = "live";
       else if (now > mt + 3 * 60 * 60 * 1000) status = "finished";
       else status = "upcoming";
+
       const servers: any[] = [];
       if (status === "live" && it.anchors) {
-        const anchorSlice = it.anchors.slice(0, 3); 
+        // Limit concurrent server fetches to prevent abuse
+        const anchorSlice = it.anchors.slice(0, 3); // Max 3 servers per match
         for (const a of anchorSlice) {
           const room = a.anchor?.roomNum;
           if (!room) continue;
@@ -776,8 +915,10 @@ async function fetchMatches(date: string) {
           if (hdM3u8) servers.push({ name: "Soco HD", stream_url: hdM3u8 });
         }
       }
+
       const homeLogo = it.homeLogo || it.hostLogo || it.homeIcon || it.hostIcon || null;
       const awayLogo = it.awayLogo || it.guestLogo || it.awayIcon || it.guestIcon || null;
+
       results.push({
         match_time: new Date(mt).toLocaleTimeString("en-US", {
           timeZone: "Asia/Yangon",
