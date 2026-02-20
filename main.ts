@@ -13,43 +13,31 @@ const DEV_CONTACT_URL = Deno.env.get("DEV_CONTACT_URL") || "https://t.me/youruse
 const DEV_PROFILE_IMG = Deno.env.get("DEV_PROFILE_IMG") || "https://ui-avatars.com/api/?name=Dev&background=d97706&color=fff&size=128";
 const DEV_DISPLAY_NAME = Deno.env.get("DEV_DISPLAY_NAME") || "Developer";
 
-// ====== SECURITY: Allowed stream domains (whitelist) ======
-const ALLOWED_STREAM_DOMAINS: string[] = (() => {
-  const envDomains = Deno.env.get("ALLOWED_STREAM_DOMAINS");
-  if (envDomains) {
-    return envDomains.split(",").map(d => d.trim().toLowerCase()).filter(Boolean);
-  }
-  return [];
-})();
+// ====== Allowed API Hostnames (whitelist for proxy) ======
+const ALLOWED_PROXY_HOSTS = new Set<string>();
+try {
+  if (MATCH_API_BASE) ALLOWED_PROXY_HOSTS.add(new URL(MATCH_API_BASE).hostname);
+  if (ROOM_API_BASE) ALLOWED_PROXY_HOSTS.add(new URL(ROOM_API_BASE).hostname);
+} catch (_) { /* ignore parse errors */ }
+// Add any additional CDN/stream hostnames your streams come from:
+const EXTRA_ALLOWED_HOSTS = Deno.env.get("ALLOWED_STREAM_HOSTS")?.split(",").map(h => h.trim()) || [];
+EXTRA_ALLOWED_HOSTS.forEach(h => { if (h) ALLOWED_PROXY_HOSTS.add(h); });
 
 // ====== SECURITY: Rate Limiter ======
 const rateLimitMap = new Map<string, { count: number; resetTime: number }>();
 const RATE_LIMIT_WINDOW = 60_000;
 const RATE_LIMIT_MAX = 60;
 const BLOCK_THRESHOLD = 200;
-const RATE_LIMIT_MAP_MAX_SIZE = 50_000; // Prevent memory exhaustion
 const blockedIPs = new Map<string, number>();
+const MAX_TRACKED_IPS = 50_000; // Prevent memory exhaustion
 
 function getClientIP(req: Request): string {
-  // In production behind a trusted reverse proxy (e.g., Deno Deploy, Cloudflare),
-  // cf-connecting-ip is set by Cloudflare and is trustworthy.
-  // x-forwarded-for can be spoofed if not behind trusted proxy.
-  // Prioritize cf-connecting-ip > x-real-ip > x-forwarded-for last entry
-  const cfIP = req.headers.get("cf-connecting-ip");
-  if (cfIP) return cfIP.trim();
-
-  const realIP = req.headers.get("x-real-ip");
-  if (realIP) return realIP.trim();
-
-  const xff = req.headers.get("x-forwarded-for");
-  if (xff) {
-    // Use the LAST entry (closest to reverse proxy) to reduce spoofing risk
-    // when behind a single trusted proxy. If behind multiple, adjust accordingly.
-    const parts = xff.split(",").map(s => s.trim()).filter(Boolean);
-    if (parts.length > 0) return parts[parts.length - 1];
-  }
-
-  return "unknown";
+  return (
+    req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ||
+    req.headers.get("cf-connecting-ip") ||
+    req.headers.get("x-real-ip") ||
+    "unknown"
+  );
 }
 
 function isRateLimited(ip: string): { limited: boolean; blocked: boolean } {
@@ -64,16 +52,9 @@ function isRateLimited(ip: string): { limited: boolean; blocked: boolean } {
 
   const entry = rateLimitMap.get(ip);
   if (!entry || now > entry.resetTime) {
-    // Prevent memory exhaustion: if map is too large, clear old entries
-    if (rateLimitMap.size >= RATE_LIMIT_MAP_MAX_SIZE) {
-      const cutoff = now - RATE_LIMIT_WINDOW;
-      for (const [key, val] of rateLimitMap) {
-        if (val.resetTime < cutoff) rateLimitMap.delete(key);
-      }
-      // If still too large after cleanup, reject (defensive)
-      if (rateLimitMap.size >= RATE_LIMIT_MAP_MAX_SIZE) {
-        return { limited: true, blocked: false };
-      }
+    // Prevent memory exhaustion: if too many IPs tracked, clear old entries
+    if (rateLimitMap.size >= MAX_TRACKED_IPS) {
+      cleanupRateLimitMaps();
     }
     rateLimitMap.set(ip, { count: 1, resetTime: now + RATE_LIMIT_WINDOW });
     return { limited: false, blocked: false };
@@ -83,6 +64,7 @@ function isRateLimited(ip: string): { limited: boolean; blocked: boolean } {
 
   if (entry.count > BLOCK_THRESHOLD) {
     blockedIPs.set(ip, now + 10 * 60_000);
+    rateLimitMap.delete(ip);
     return { limited: true, blocked: true };
   }
 
@@ -93,8 +75,7 @@ function isRateLimited(ip: string): { limited: boolean; blocked: boolean } {
   return { limited: false, blocked: false };
 }
 
-// Clean up stale entries periodically
-setInterval(() => {
+function cleanupRateLimitMaps() {
   const now = Date.now();
   for (const [ip, entry] of rateLimitMap) {
     if (now > entry.resetTime) rateLimitMap.delete(ip);
@@ -102,7 +83,10 @@ setInterval(() => {
   for (const [ip, expiry] of blockedIPs) {
     if (now > expiry) blockedIPs.delete(ip);
   }
-}, 5 * 60_000);
+}
+
+// Clean up stale entries periodically
+setInterval(cleanupRateLimitMaps, 5 * 60_000);
 
 // ====== SECURITY: Suspicious Request Detection ======
 function isSuspiciousRequest(req: Request): boolean {
@@ -122,8 +106,10 @@ function isSuspiciousRequest(req: Request): boolean {
   if (botPatterns.some((p) => p.test(ua))) return true;
 
   const path = url.pathname;
-  if (path.includes("..") || path.includes("//") || path.includes("\\"))
-    return true;
+  if (path.includes("..") || path.includes("//") || path.includes("\\")) return true;
+
+  // Block null bytes in any part of the URL
+  if (url.href.includes("\x00") || url.href.includes("%00")) return true;
 
   const maliciousPaths = [
     /\.env/i, /\.git/i, /wp-admin/i, /wp-login/i,
@@ -144,92 +130,8 @@ function isSuspiciousRequest(req: Request): boolean {
   return false;
 }
 
-// ====== SECURITY: SSRF Prevention - Block internal/private IPs ======
-function isInternalUrl(urlStr: string): boolean {
-  try {
-    const parsed = new URL(urlStr);
-    const hostname = parsed.hostname.toLowerCase();
-
-    // Block localhost variants
-    if (
-      hostname === "localhost" ||
-      hostname === "127.0.0.1" ||
-      hostname === "[::1]" ||
-      hostname === "::1" ||
-      hostname === "0.0.0.0"
-    ) {
-      return true;
-    }
-
-    // Block private IP ranges
-    const privatePatterns = [
-      /^10\.\d{1,3}\.\d{1,3}\.\d{1,3}$/,        // 10.0.0.0/8
-      /^172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}$/, // 172.16.0.0/12
-      /^192\.168\.\d{1,3}\.\d{1,3}$/,              // 192.168.0.0/16
-      /^169\.254\.\d{1,3}\.\d{1,3}$/,              // Link-local
-      /^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.\d{1,3}\.\d{1,3}$/, // CGN 100.64.0.0/10
-      /^0\.0\.0\.0$/,
-      /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/,         // 127.0.0.0/8
-    ];
-    if (privatePatterns.some(p => p.test(hostname))) return true;
-
-    // Block .local, .internal, .corp, etc.
-    if (
-      hostname.endsWith(".local") ||
-      hostname.endsWith(".internal") ||
-      hostname.endsWith(".corp") ||
-      hostname.endsWith(".lan") ||
-      hostname.endsWith(".home")
-    ) {
-      return true;
-    }
-
-    // Block metadata endpoints (AWS, GCP, Azure)
-    if (
-      hostname === "169.254.169.254" ||
-      hostname === "metadata.google.internal" ||
-      hostname === "metadata.google.com"
-    ) {
-      return true;
-    }
-
-    // Block non-http(s) schemes
-    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-      return true;
-    }
-
-    return false;
-  } catch {
-    return true; // If URL parsing fails, treat as internal/unsafe
-  }
-}
-
-// ====== SECURITY: Check if stream URL domain is allowed ======
-function isAllowedStreamDomain(urlStr: string): boolean {
-  // If no whitelist configured, allow all non-internal URLs (backward compat)
-  if (ALLOWED_STREAM_DOMAINS.length === 0) return true;
-
-  try {
-    const parsed = new URL(urlStr);
-    const hostname = parsed.hostname.toLowerCase();
-    return ALLOWED_STREAM_DOMAINS.some(domain => {
-      return hostname === domain || hostname.endsWith("." + domain);
-    });
-  } catch {
-    return false;
-  }
-}
-
 // ====== SECURITY: Response Headers ======
-function securityHeaders(nonce?: string): Record<string, string> {
-  const cspNonce = nonce || "";
-  const scriptSrc = cspNonce
-    ? `'nonce-${cspNonce}' https://cdn.tailwindcss.com https://cdn.jsdelivr.net`
-    : "'self' 'unsafe-inline' https://cdn.tailwindcss.com https://cdn.jsdelivr.net";
-  const styleSrc = cspNonce
-    ? `'self' 'nonce-${cspNonce}' https://fonts.googleapis.com`
-    : "'self' 'unsafe-inline' https://fonts.googleapis.com";
-
+function securityHeaders(): Record<string, string> {
   return {
     "X-Content-Type-Options": "nosniff",
     "X-Frame-Options": "DENY",
@@ -238,24 +140,69 @@ function securityHeaders(nonce?: string): Record<string, string> {
     "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
     "Content-Security-Policy":
       "default-src 'self'; " +
-      `script-src ${scriptSrc}; ` +
-      `style-src ${styleSrc}; ` +
+      "script-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com https://cdn.jsdelivr.net; " +
+      "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; " +
       "font-src https://fonts.gstatic.com; " +
       "img-src 'self' https: data:; " +
       "media-src 'self' https: blob:; " +
-      "connect-src 'self' https: blob:; " +
-      "frame-ancestors 'none'; " +
-      "base-uri 'self'; " +
-      "form-action 'self';",
+      "connect-src 'self' https: blob:;",
     "Strict-Transport-Security": "max-age=31536000; includeSubDomains",
   };
 }
 
-// ====== SECURITY: Generate CSP Nonce ======
-function generateNonce(): string {
-  const array = new Uint8Array(16);
-  crypto.getRandomValues(array);
-  return btoa(String.fromCharCode(...array)).replace(/[+/=]/g, "");
+// ====== SECURITY: Validate proxy target URL (anti-SSRF) ======
+function isAllowedProxyUrl(targetUrl: string): boolean {
+  try {
+    const parsed = new URL(targetUrl);
+
+    // Only allow http/https
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return false;
+
+    const hostname = parsed.hostname.toLowerCase();
+
+    // Block private/internal IPs
+    if (
+      hostname === "localhost" ||
+      hostname === "127.0.0.1" ||
+      hostname === "0.0.0.0" ||
+      hostname === "[::1]" ||
+      hostname.startsWith("10.") ||
+      hostname.startsWith("192.168.") ||
+      hostname.startsWith("169.254.") ||
+      hostname.endsWith(".local") ||
+      hostname.endsWith(".internal") ||
+      /^172\.(1[6-9]|2\d|3[01])\./.test(hostname) ||
+      /^0\./.test(hostname) ||
+      /^\[?fe80:/i.test(hostname) ||
+      /^\[?fd[0-9a-f]{2}:/i.test(hostname) ||
+      /^\[?fc[0-9a-f]{2}:/i.test(hostname)
+    ) {
+      return false;
+    }
+
+    // Block cloud metadata endpoints
+    if (
+      hostname === "metadata.google.internal" ||
+      hostname === "metadata.google.com" ||
+      hostname === "169.254.169.254"
+    ) {
+      return false;
+    }
+
+    // If we have a whitelist configured, enforce it
+    // (skip whitelist check if no hosts are configured, for flexibility)
+    if (ALLOWED_PROXY_HOSTS.size > 0) {
+      // Allow if hostname or a parent domain is whitelisted
+      const isWhitelisted = [...ALLOWED_PROXY_HOSTS].some(allowed => {
+        return hostname === allowed || hostname.endsWith("." + allowed);
+      });
+      if (!isWhitelisted) return false;
+    }
+
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 // ====== SECURITY: Sanitize URL (only allow http/https) ======
@@ -263,7 +210,7 @@ function sanitizeUrl(url: string | null | undefined): string | null {
   if (!url || typeof url !== "string") return null;
   const trimmed = url.trim();
   if (/^https?:\/\//i.test(trimmed)) {
-    return trimmed.replace(/[<>"'`\s]/g, "");
+    return trimmed.replace(/[<>"'`\s\x00-\x1f]/g, "");
   }
   return null;
 }
@@ -289,14 +236,9 @@ async function handleStreamProxy(req: Request, url: URL): Promise<Response> {
     return new Response("Invalid URL", { status: 400, headers: securityHeaders() });
   }
 
-  // SSRF prevention: block internal/private URLs
-  if (isInternalUrl(streamUrl)) {
-    return new Response("Forbidden", { status: 403, headers: securityHeaders() });
-  }
-
-  // Domain whitelist check
-  if (!isAllowedStreamDomain(streamUrl)) {
-    return new Response("Forbidden: domain not allowed", { status: 403, headers: securityHeaders() });
+  // SSRF protection: block internal/private addresses
+  if (!isAllowedProxyUrl(streamUrl)) {
+    return new Response("Forbidden URL target", { status: 403, headers: securityHeaders() });
   }
 
   try {
@@ -308,8 +250,8 @@ async function handleStreamProxy(req: Request, url: URL): Promise<Response> {
         "User-Agent": API_USER_AGENT,
         Referer: API_REFERER,
       },
-      signal: controller.signal,
       redirect: "follow",
+      signal: controller.signal,
     });
     clearTimeout(timeout);
 
@@ -317,10 +259,11 @@ async function handleStreamProxy(req: Request, url: URL): Promise<Response> {
       return new Response("Stream unavailable", { status: 502, headers: securityHeaders() });
     }
 
-    // Validate response size (prevent proxying huge files)
-    const contentLength = proxyRes.headers.get("content-length");
-    if (contentLength && parseInt(contentLength) > 50 * 1024 * 1024) {
-      return new Response("Response too large", { status: 502, headers: securityHeaders() });
+    // Validate that redirected URL is also safe
+    if (proxyRes.url && proxyRes.url !== streamUrl) {
+      if (!isAllowedProxyUrl(proxyRes.url)) {
+        return new Response("Forbidden redirect target", { status: 403, headers: securityHeaders() });
+      }
     }
 
     const contentType = proxyRes.headers.get("content-type") || "";
@@ -329,9 +272,9 @@ async function handleStreamProxy(req: Request, url: URL): Promise<Response> {
     if (streamUrl.endsWith(".m3u8") || contentType.includes("mpegurl") || contentType.includes("m3u8")) {
       const text = await proxyRes.text();
 
-      // Validate m3u8 content size
+      // Limit m3u8 file size to prevent abuse
       if (text.length > 1024 * 1024) {
-        return new Response("Playlist too large", { status: 502, headers: securityHeaders() });
+        return new Response("Playlist too large", { status: 413, headers: securityHeaders() });
       }
 
       const baseUrl = streamUrl.substring(0, streamUrl.lastIndexOf("/") + 1);
@@ -345,8 +288,6 @@ async function handleStreamProxy(req: Request, url: URL): Promise<Response> {
           } else {
             absoluteUrl = baseUrl + trimmed;
           }
-          // Validate the resolved URL too
-          if (isInternalUrl(absoluteUrl)) return "";
           return "/api/stream-proxy?url=" + encodeURIComponent(absoluteUrl);
         }
         return line;
@@ -361,16 +302,6 @@ async function handleStreamProxy(req: Request, url: URL): Promise<Response> {
           ...securityHeaders(),
         },
       });
-    }
-
-    // For non-m3u8: only allow expected content types for stream segments
-    const allowedTypes = [
-      "video/mp2t", "video/", "application/octet-stream",
-      "audio/", "application/vnd.apple.mpegurl", "binary/octet-stream",
-    ];
-    const isAllowedType = !contentType || allowedTypes.some(t => contentType.includes(t));
-    if (!isAllowedType) {
-      return new Response("Invalid content type", { status: 403, headers: securityHeaders() });
     }
 
     const resHeaders: Record<string, string> = {
@@ -389,14 +320,25 @@ async function handleStreamProxy(req: Request, url: URL): Promise<Response> {
       headers: resHeaders,
     });
   } catch (e: any) {
+    if (e.name === "AbortError") {
+      return new Response("Stream timeout", { status: 504, headers: securityHeaders() });
+    }
     console.warn("Stream proxy error:", e.message);
     return new Response("Stream error", { status: 502, headers: securityHeaders() });
   }
 }
 
+// ====== Valid API routes ======
+const VALID_ROUTES = new Set(["/", "/api/matches", "/api/stream-proxy"]);
+
 serve(async (req) => {
   const url = new URL(req.url);
   const clientIP = getClientIP(req);
+
+  // Only allow known routes
+  if (!VALID_ROUTES.has(url.pathname)) {
+    return new Response("Not Found", { status: 404, headers: securityHeaders() });
+  }
 
   const { limited, blocked } = isRateLimited(clientIP);
   if (blocked) {
@@ -464,10 +406,8 @@ serve(async (req) => {
       allMatches.sort((a, b) => {
         if (a.match_status === "live" && b.match_status !== "live") return -1;
         if (a.match_status !== "live" && b.match_status === "live") return 1;
-        if (a.match_status === "upcoming" && b.match_status === "finished")
-          return -1;
-        if (a.match_status === "finished" && b.match_status === "upcoming")
-          return 1;
+        if (a.match_status === "upcoming" && b.match_status === "finished") return -1;
+        if (a.match_status === "finished" && b.match_status === "upcoming") return 1;
         return 0;
       });
 
@@ -499,11 +439,10 @@ serve(async (req) => {
 
   // --- 3. FRONTEND UI (HTML) ---
   if (url.pathname === "/") {
-    const nonce = generateNonce();
-    return new Response(getHTML(nonce), {
+    return new Response(getHTML(), {
       headers: {
         "Content-Type": "text/html; charset=utf-8",
-        ...securityHeaders(nonce),
+        ...securityHeaders(),
       },
     });
   }
@@ -512,7 +451,7 @@ serve(async (req) => {
 });
 
 // ====== FRONTEND HTML ======
-function getHTML(nonce: string): string {
+function getHTML(): string {
   const safeDevUrl = sanitizeUrl(DEV_CONTACT_URL) || "#";
   const safeDevImg = sanitizeUrl(DEV_PROFILE_IMG) || "";
   const safeDevName = sanitizeText(DEV_DISPLAY_NAME, 50) || "Developer";
@@ -523,10 +462,10 @@ function getHTML(nonce: string): string {
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
   <title>All Sports Live</title>
-  <script nonce="${nonce}" src="https://cdn.tailwindcss.com"><\/script>
-  <script nonce="${nonce}" src="https://cdn.jsdelivr.net/npm/hls.js@latest"><\/script>
+  <script src="https://cdn.tailwindcss.com"><\/script>
+  <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"><\/script>
   <link href="https://fonts.googleapis.com/css2?family=Padauk:wght@400;700&family=Inter:wght@300;400;500;600;700;800;900&display=swap" rel="stylesheet">
-  <style nonce="${nonce}">
+  <style>
     * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
 
     body {
@@ -924,10 +863,16 @@ function getHTML(nonce: string): string {
             <h1 class="header-title text-xl">All Sports Live</h1>
             <p class="header-subtitle mt-0.5">Premium Sports Streaming</p>
           </div>
-          <a href="${safeDevUrl}" target="_blank" rel="noopener noreferrer" title="Contact ${safeDevName}" class="dev-contact-link">
-            <img src="${safeDevImg}" alt="${safeDevName}" class="dev-avatar" onerror="this.style.display='none'">
-            <span class="dev-name">${safeDevName}</span>
-          </a>
+          <div class="flex items-center gap-3">
+            <a href="${safeDevUrl}" target="_blank" rel="noopener noreferrer" title="Contact ${safeDevName}" class="dev-contact-link">
+              <img src="${safeDevImg}" alt="${safeDevName}" class="dev-avatar" onerror="this.style.display='none'">
+              <span class="dev-name">${safeDevName}</span>
+            </a>
+            <div class="text-right">
+              <div class="text-[10px] text-slate-400 font-medium">Myanmar Time</div>
+              <div id="clock" class="text-sm font-bold text-slate-600 font-mono tracking-wide">--:--</div>
+            </div>
+          </div>
         </div>
       </div>
     </div>
@@ -984,7 +929,7 @@ function getHTML(nonce: string): string {
     </div>
   </div>
 
-  <script nonce="${nonce}">
+  <script>
     "use strict";
     var allData = [];
     var currentFilter = "all";
@@ -997,6 +942,19 @@ function getHTML(nonce: string): string {
       div.textContent = str;
       return div.innerHTML;
     }
+
+    function updateClock() {
+      try {
+        var now = new Date();
+        var mmTime = now.toLocaleTimeString("en-US", {
+          timeZone: "Asia/Yangon",
+          hour: "2-digit", minute: "2-digit", hour12: true
+        });
+        document.getElementById("clock").textContent = mmTime;
+      } catch(e) {}
+    }
+    updateClock();
+    setInterval(updateClock, 30000);
 
     document.getElementById("tabs").addEventListener("click", function(e) {
       var btn = e.target.closest(".tab-btn");
@@ -1223,10 +1181,7 @@ function getHTML(nonce: string): string {
       var overlay = document.createElement("div");
       overlay.id = "player-error-overlay";
       overlay.className = "player-error";
-
-      var msgDiv = document.createElement("div");
-      msgDiv.textContent = message;
-      overlay.appendChild(msgDiv);
+      overlay.innerHTML = '<div>' + escapeHtml(message) + '</div>';
 
       if (currentStreamUrl) {
         var retryBtn = document.createElement("button");
@@ -1374,18 +1329,9 @@ async function fetchServerURL(roomNum: any) {
     clearTimeout(timeout);
 
     const txt = await res.text();
-
-    // Limit response size to prevent abuse
-    if (txt.length > 512 * 1024) return { m3u8: null, hdM3u8: null };
-
-    const m = txt.match(/detail\((.*)\)/s);
+    const m = txt.match(/detail\((.*)\)/);
     if (m) {
-      let js: any;
-      try {
-        js = JSON.parse(m[1]);
-      } catch {
-        return { m3u8: null, hdM3u8: null };
-      }
+      const js = JSON.parse(m[1]);
       if (js.code === 200 && js.data && js.data.stream) {
         const m3u8 = sanitizeUrl(js.data.stream.m3u8);
         const hdM3u8 = sanitizeUrl(js.data.stream.hdM3u8);
@@ -1412,34 +1358,25 @@ async function fetchMatches(date: string) {
     clearTimeout(timeout);
 
     const txt = await res.text();
-
-    // Limit response size
-    if (txt.length > 5 * 1024 * 1024) return [];
-
-    const m = txt.match(/matches_\d+\((.*)\)/s);
+    const m = txt.match(/matches_\d+\((.*)\)/);
     if (!m) return [];
 
-    let js: any;
-    try {
-      js = JSON.parse(m[1]);
-    } catch {
-      return [];
-    }
-    if (js.code !== 200) return [];
+    const js = JSON.parse(m[1]);
+    if (js.code !== 200 || !Array.isArray(js.data)) return [];
 
     const now = Date.now();
     const results = [];
 
-    // Limit to reasonable number of matches to prevent DoS
-    const matchData = Array.isArray(js.data) ? js.data.slice(0, 500) : [];
+    // Limit number of matches processed to prevent abuse
+    const maxMatches = 500;
+    const data = js.data.slice(0, maxMatches);
 
-    for (const it of matchData) {
+    for (const it of data) {
       const mt = it.matchTime;
 
       if (!mt || typeof mt !== "number") continue;
-
-      // Sanity check: match time should be within reasonable range (±7 days)
-      if (Math.abs(now - mt) > 7 * 24 * 60 * 60 * 1000) continue;
+      // Sanity check: timestamp should be within reasonable range (±7 days)
+      if (Math.abs(mt - now) > 7 * 24 * 60 * 60 * 1000) continue;
 
       let status: string;
       if (now >= mt && now <= mt + 3 * 60 * 60 * 1000) status = "live";
@@ -1447,8 +1384,8 @@ async function fetchMatches(date: string) {
       else status = "upcoming";
 
       const servers: any[] = [];
-      if (status === "live" && it.anchors) {
-        const anchorSlice = Array.isArray(it.anchors) ? it.anchors.slice(0, 3) : [];
+      if (status === "live" && it.anchors && Array.isArray(it.anchors)) {
+        const anchorSlice = it.anchors.slice(0, 3);
         for (const a of anchorSlice) {
           const room = a.anchor?.roomNum;
           if (!room) continue;
@@ -1482,7 +1419,7 @@ async function fetchMatches(date: string) {
       if (it.homeScore !== undefined && it.homeScore !== null) {
         const hs = String(it.homeScore).replace(/[^0-9]/g, "").slice(0, 3);
         const as = String(it.awayScore).replace(/[^0-9]/g, "").slice(0, 3);
-        matchScore = hs + " - " + as;
+        matchScore = `${hs} - ${as}`;
       }
 
       // ---- Compute match_day label ----
