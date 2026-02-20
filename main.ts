@@ -32,7 +32,6 @@ const streamTokenMap = new Map<
 >();
 
 function createStreamToken(originalUrl: string): string {
-  // Check if a token already exists for this URL (avoid duplicates)
   for (const [token, entry] of streamTokenMap) {
     if (entry.url === originalUrl && Date.now() < entry.expires) {
       return token;
@@ -48,7 +47,6 @@ function createStreamToken(originalUrl: string): string {
 
 function resolveStreamToken(token: string): string | null {
   if (!token || typeof token !== "string") return null;
-  // Validate UUID format
   if (
     !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
       token
@@ -64,7 +62,6 @@ function resolveStreamToken(token: string): string | null {
   return entry.url;
 }
 
-// Cleanup expired tokens periodically
 setInterval(() => {
   const now = Date.now();
   for (const [token, entry] of streamTokenMap) {
@@ -98,38 +95,30 @@ function isRateLimited(
   isStream: boolean = false
 ): { limited: boolean; blocked: boolean } {
   const now = Date.now();
-
   const blockExpiry = blockedIPs.get(ip);
   if (blockExpiry && now < blockExpiry) {
     return { limited: true, blocked: true };
   } else if (blockExpiry) {
     blockedIPs.delete(ip);
   }
-
   const map = isStream ? streamRateLimitMap : rateLimitMap;
   const maxLimit = isStream ? STREAM_RATE_LIMIT_MAX : RATE_LIMIT_MAX;
-
   const entry = map.get(ip);
   if (!entry || now > entry.resetTime) {
     map.set(ip, { count: 1, resetTime: now + RATE_LIMIT_WINDOW });
     return { limited: false, blocked: false };
   }
-
   entry.count++;
-
   if (entry.count > BLOCK_THRESHOLD) {
     blockedIPs.set(ip, now + 10 * 60_000);
     return { limited: true, blocked: true };
   }
-
   if (entry.count > maxLimit) {
     return { limited: true, blocked: false };
   }
-
   return { limited: false, blocked: false };
 }
 
-// Clean up stale entries periodically
 setInterval(() => {
   const now = Date.now();
   for (const [ip, entry] of rateLimitMap) {
@@ -143,12 +132,11 @@ setInterval(() => {
   }
 }, 5 * 60_000);
 
-// ====== SECURITY: SSRF Protection - Block private/internal IPs ======
+// ====== SECURITY: SSRF Protection ======
 function isPrivateUrl(urlStr: string): boolean {
   try {
     const parsed = new URL(urlStr);
     const hostname = parsed.hostname.toLowerCase();
-
     if (
       hostname === "localhost" ||
       hostname === "127.0.0.1" ||
@@ -157,7 +145,6 @@ function isPrivateUrl(urlStr: string): boolean {
       hostname === "0.0.0.0"
     )
       return true;
-
     const ipMatch = hostname.match(
       /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/
     );
@@ -170,7 +157,6 @@ function isPrivateUrl(urlStr: string): boolean {
       if (a === 127) return true;
       if (a === 0) return true;
     }
-
     if (
       hostname.endsWith(".local") ||
       hostname.endsWith(".internal") ||
@@ -180,12 +166,9 @@ function isPrivateUrl(urlStr: string): boolean {
       hostname.startsWith("169.254.")
     )
       return true;
-
     if (hostname === "169.254.169.254") return true;
-
     if (parsed.protocol !== "http:" && parsed.protocol !== "https:")
       return true;
-
     return false;
   } catch {
     return true;
@@ -196,66 +179,29 @@ function isPrivateUrl(urlStr: string): boolean {
 function isSuspiciousRequest(req: Request): boolean {
   const ua = req.headers.get("user-agent") || "";
   const url = new URL(req.url);
-
   if (!ua || ua.length < 10) return true;
-
   const botPatterns = [
-    /sqlmap/i,
-    /nikto/i,
-    /nmap/i,
-    /masscan/i,
-    /dirbuster/i,
-    /gobuster/i,
-    /wfuzz/i,
-    /hydra/i,
-    /burpsuite/i,
-    /nessus/i,
-    /openvas/i,
-    /acunetix/i,
-    /zgrab/i,
-    /nuclei/i,
-    /scrapy/i,
+    /sqlmap/i, /nikto/i, /nmap/i, /masscan/i, /dirbuster/i,
+    /gobuster/i, /wfuzz/i, /hydra/i, /burpsuite/i, /nessus/i,
+    /openvas/i, /acunetix/i, /zgrab/i, /nuclei/i, /scrapy/i,
   ];
   if (botPatterns.some((p) => p.test(ua))) return true;
-
   const path = url.pathname;
   if (path.includes("..") || path.includes("//") || path.includes("\\"))
     return true;
-
   const maliciousPaths = [
-    /\.env/i,
-    /\.git/i,
-    /wp-admin/i,
-    /wp-login/i,
-    /phpmyadmin/i,
-    /\/admin\b/i,
-    /\.php$/i,
-    /\.asp$/i,
-    /shell/i,
-    /eval\(/i,
-    /exec\(/i,
-    /\.sql$/i,
-    /backup/i,
-    /\.bak$/i,
-    /\.log$/i,
+    /\.env/i, /\.git/i, /wp-admin/i, /wp-login/i, /phpmyadmin/i,
+    /\/admin\b/i, /\.php$/i, /\.asp$/i, /shell/i, /eval\(/i,
+    /exec\(/i, /\.sql$/i, /backup/i, /\.bak$/i, /\.log$/i,
   ];
   if (maliciousPaths.some((p) => p.test(path))) return true;
-
   const query = url.search;
   const sqlPatterns = [
-    /union.*select/i,
-    /or\s+1\s*=\s*1/i,
-    /drop\s+table/i,
-    /insert\s+into/i,
-    /delete\s+from/i,
-    /script>/i,
-    /<iframe/i,
-    /javascript:/i,
-    /onerror\s*=/i,
-    /onload\s*=/i,
+    /union.*select/i, /or\s+1\s*=\s*1/i, /drop\s+table/i,
+    /insert\s+into/i, /delete\s+from/i, /script>/i, /<iframe/i,
+    /javascript:/i, /onerror\s*=/i, /onload\s*=/i,
   ];
   if (sqlPatterns.some((p) => p.test(query))) return true;
-
   return false;
 }
 
@@ -272,7 +218,7 @@ function securityHeaders(): Record<string, string> {
       "script-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com https://cdn.jsdelivr.net; " +
       "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; " +
       "font-src https://fonts.gstatic.com; " +
-      "img-src 'self' https: data:; " +
+      "img-src 'self' data:; " +
       "media-src 'self' blob:; " +
       "connect-src 'self';",
     "Strict-Transport-Security": "max-age=31536000; includeSubDomains",
@@ -328,57 +274,43 @@ function isValidProxyReferer(req: Request): boolean {
   const referer = req.headers.get("referer");
   const origin = req.headers.get("origin");
   const host = req.headers.get("host");
-
   if (!host) return false;
-
   if (referer) {
     try {
       const refUrl = new URL(referer);
       if (refUrl.host === host) return true;
-    } catch {
-      /* ignore */
-    }
+    } catch { /* ignore */ }
   }
-
   if (origin) {
     try {
       const origUrl = new URL(origin);
       if (origUrl.host === host) return true;
-    } catch {
-      /* ignore */
-    }
+    } catch { /* ignore */ }
   }
-
   if (!referer && !origin) return true;
-
   return false;
 }
 
 // ====== Stream Proxy Route (Token-Based) ======
-const MAX_PROXY_BODY_SIZE = 50 * 1024 * 1024; // 50MB limit
+const MAX_PROXY_BODY_SIZE = 50 * 1024 * 1024;
 
 async function handleStreamProxy(
   req: Request,
   url: URL
 ): Promise<Response> {
-  // Validate referer
   if (!isValidProxyReferer(req)) {
     return new Response("Forbidden", {
       status: 403,
       headers: securityHeaders(),
     });
   }
-
   const token = url.searchParams.get("token");
-
   if (!token) {
     return new Response("Missing token", {
       status: 400,
       headers: securityHeaders(),
     });
   }
-
-  // Resolve token to real URL (server-side only)
   const streamUrl = resolveStreamToken(token);
   if (!streamUrl) {
     return new Response("Invalid or expired token", {
@@ -386,19 +318,15 @@ async function handleStreamProxy(
       headers: securityHeaders(),
     });
   }
-
-  // SSRF Protection
   if (isPrivateUrl(streamUrl)) {
     return new Response("Forbidden", {
       status: 403,
       headers: securityHeaders(),
     });
   }
-
   try {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 15000);
-
     const proxyRes = await fetch(streamUrl, {
       headers: {
         "User-Agent": API_USER_AGENT,
@@ -407,17 +335,13 @@ async function handleStreamProxy(
       signal: controller.signal,
     });
     clearTimeout(timeout);
-
     if (!proxyRes.ok) {
       return new Response("Stream unavailable", {
         status: 502,
         headers: securityHeaders(),
       });
     }
-
     const contentType = proxyRes.headers.get("content-type") || "";
-
-    // Content-type validation
     if (
       contentType &&
       !streamUrl.endsWith(".ts") &&
@@ -432,16 +356,12 @@ async function handleStreamProxy(
         headers: securityHeaders(),
       });
     }
-
-    // Handle m3u8 playlists - rewrite internal URLs to token-based proxy URLs
     if (
       streamUrl.endsWith(".m3u8") ||
       contentType.includes("mpegurl") ||
       contentType.includes("m3u8")
     ) {
       const text = await proxyRes.text();
-
-      // Validate m3u8 content
       const trimmedText = text.trim();
       if (
         trimmedText.length > 0 &&
@@ -453,10 +373,8 @@ async function handleStreamProxy(
           headers: securityHeaders(),
         });
       }
-
       const baseUrl =
         streamUrl.substring(0, streamUrl.lastIndexOf("/") + 1);
-
       const rewritten = text
         .split("\n")
         .map((line: string) => {
@@ -471,11 +389,9 @@ async function handleStreamProxy(
             if (isPrivateUrl(absoluteUrl)) {
               return "# blocked-private-url";
             }
-            // Create opaque token for each segment/sub-playlist
             const segToken = createStreamToken(absoluteUrl);
             return "/api/stream-proxy?token=" + segToken;
           }
-          // Also rewrite URI= references in #EXT-X-KEY and similar tags
           if (trimmed.startsWith("#") && trimmed.includes('URI="')) {
             return line.replace(
               /URI="([^"]+)"/g,
@@ -499,7 +415,6 @@ async function handleStreamProxy(
           return line;
         })
         .join("\n");
-
       return new Response(rewritten, {
         status: 200,
         headers: {
@@ -510,8 +425,6 @@ async function handleStreamProxy(
         },
       });
     }
-
-    // For non-m3u8 responses, enforce size limit
     const contentLength = proxyRes.headers.get("content-length");
     if (contentLength && parseInt(contentLength) > MAX_PROXY_BODY_SIZE) {
       return new Response("Response too large", {
@@ -519,7 +432,6 @@ async function handleStreamProxy(
         headers: securityHeaders(),
       });
     }
-
     const resHeaders: Record<string, string> = {
       "Access-Control-Allow-Origin": "*",
       "Cache-Control": "public, max-age=10",
@@ -534,7 +446,6 @@ async function handleStreamProxy(
     } else if (streamUrl.endsWith(".aac")) {
       resHeaders["Content-Type"] = "audio/aac";
     }
-
     return new Response(proxyRes.body, {
       status: 200,
       headers: resHeaders,
@@ -548,13 +459,81 @@ async function handleStreamProxy(
   }
 }
 
+// ====== Image Proxy Route (Token-Based) ======
+async function handleImageProxy(
+  req: Request,
+  url: URL
+): Promise<Response> {
+  if (!isValidProxyReferer(req)) {
+    return new Response("Forbidden", { status: 403, headers: securityHeaders() });
+  }
+
+  const token = url.searchParams.get("token");
+  if (!token) {
+    return new Response("Missing token", { status: 400, headers: securityHeaders() });
+  }
+
+  const imgUrl = resolveStreamToken(token);
+  if (!imgUrl) {
+    return new Response("Invalid or expired token", { status: 403, headers: securityHeaders() });
+  }
+
+  if (isPrivateUrl(imgUrl)) {
+    return new Response("Forbidden", { status: 403, headers: securityHeaders() });
+  }
+
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 10000);
+
+    const proxyRes = await fetch(imgUrl, {
+      headers: {
+        "User-Agent": API_USER_AGENT,
+        Referer: API_REFERER,
+      },
+      signal: controller.signal,
+    });
+    clearTimeout(timeout);
+
+    if (!proxyRes.ok) {
+      return new Response("Image unavailable", { status: 502, headers: securityHeaders() });
+    }
+
+    const contentType = proxyRes.headers.get("content-type") || "";
+    // Only allow image content types
+    if (contentType && !contentType.startsWith("image/")) {
+      return new Response("Not an image", { status: 403, headers: securityHeaders() });
+    }
+
+    // Size limit for images (5MB)
+    const contentLength = proxyRes.headers.get("content-length");
+    if (contentLength && parseInt(contentLength) > 5 * 1024 * 1024) {
+      return new Response("Image too large", { status: 502, headers: securityHeaders() });
+    }
+
+    return new Response(proxyRes.body, {
+      status: 200,
+      headers: {
+        "Content-Type": contentType || "image/png",
+        "Cache-Control": "public, max-age=86400",
+        "Access-Control-Allow-Origin": "*",
+        ...securityHeaders(),
+      },
+    });
+  } catch (e: any) {
+    console.warn("Image proxy error:", e.message);
+    return new Response("Image error", { status: 502, headers: securityHeaders() });
+  }
+}
+
 serve(async (req) => {
   const url = new URL(req.url);
   const clientIP = getClientIP(req);
 
   const isStreamReq = url.pathname === "/api/stream-proxy";
+  const isImgReq = url.pathname === "/api/img-proxy";
 
-  const { limited, blocked } = isRateLimited(clientIP, isStreamReq);
+  const { limited, blocked } = isRateLimited(clientIP, isStreamReq || isImgReq);
   if (blocked) {
     return new Response(
       JSON.stringify({ error: "Blocked: Too many requests. Try again later." }),
@@ -596,7 +575,7 @@ serve(async (req) => {
     });
   }
 
-  // --- 1. API ROUTE: Matches (tokens instead of URLs) ---
+  // --- API ROUTE: Matches ---
   if (url.pathname === "/api/matches") {
     try {
       const getVNDate = (offset: number) => {
@@ -611,15 +590,12 @@ serve(async (req) => {
           .format(d)
           .replace(/-/g, "");
       };
-
       const dates = [getVNDate(-1), getVNDate(0), getVNDate(1)];
-
       let allMatches: any[] = [];
       for (const d of dates) {
         const matches = await fetchMatches(d);
         allMatches = allMatches.concat(matches);
       }
-
       allMatches.sort((a, b) => {
         if (a.match_status === "live" && b.match_status !== "live") return -1;
         if (a.match_status !== "live" && b.match_status === "live") return 1;
@@ -629,7 +605,6 @@ serve(async (req) => {
           return 1;
         return 0;
       });
-
       return new Response(JSON.stringify(allMatches), {
         headers: {
           "Content-Type": "application/json",
@@ -651,12 +626,17 @@ serve(async (req) => {
     }
   }
 
-  // --- 2. API ROUTE: Stream Proxy (token-only, no URL exposed) ---
+  // --- API ROUTE: Stream Proxy ---
   if (url.pathname === "/api/stream-proxy") {
     return await handleStreamProxy(req, url);
   }
 
-  // --- 3. FRONTEND UI (HTML) ---
+  // --- API ROUTE: Image Proxy ---
+  if (url.pathname === "/api/img-proxy") {
+    return await handleImageProxy(req, url);
+  }
+
+  // --- FRONTEND UI ---
   if (url.pathname === "/") {
     return new Response(getHTML(), {
       headers: {
@@ -1077,7 +1057,6 @@ function getHTML(): string {
 <body>
   <div class="app-container">
 
-    <!-- Premium Header -->
     <div class="premium-header">
       <div class="max-w-md mx-auto px-5 py-4">
         <div class="flex items-center justify-between">
@@ -1095,7 +1074,6 @@ function getHTML(): string {
 
     <div class="max-w-md mx-auto px-4 pt-5 pb-4">
 
-      <!-- Filter Tabs -->
       <div class="flex gap-2 mb-4 overflow-x-auto pb-1 fade-up fade-up-delay-1" id="tabs">
         <button class="tab-btn active" data-filter="all">All Matches</button>
         <button class="tab-btn" data-filter="live">Live</button>
@@ -1103,7 +1081,6 @@ function getHTML(): string {
         <button class="tab-btn" data-filter="finished">Finished</button>
       </div>
 
-      <!-- Stats Bar -->
       <div class="flex gap-2 justify-center mb-5 fade-up fade-up-delay-2" id="stats-bar">
         <span class="stat-pill text-slate-500">
           <span class="stat-indicator" style="background:#64748b;"></span>
@@ -1119,7 +1096,6 @@ function getHTML(): string {
         </span>
       </div>
 
-      <!-- Video Player -->
       <div id="player-container" class="hidden sticky top-[68px] z-50 mb-5 player-wrapper">
         <div class="bg-black relative" id="player-inner">
           <video id="video" controls class="w-full aspect-video" autoplay playsinline></video>
@@ -1132,13 +1108,11 @@ function getHTML(): string {
         </button>
       </div>
 
-      <!-- Loading -->
       <div id="loading" class="flex flex-col items-center py-20 fade-up fade-up-delay-3">
         <div class="loading-spinner mb-4"></div>
         <span class="text-slate-400 text-sm font-medium">Loading matches...</span>
       </div>
 
-      <!-- Match List -->
       <div id="match-list" class="space-y-3"></div>
 
       <div class="bottom-safe"></div>
@@ -1379,12 +1353,10 @@ function getHTML(): string {
     function showPlayerError(message) {
       var existing = document.getElementById("player-error-overlay");
       if (existing) existing.remove();
-
       var overlay = document.createElement("div");
       overlay.id = "player-error-overlay";
       overlay.className = "player-error";
       overlay.innerHTML = '<div>' + escapeHtml(message) + '</div>';
-
       if (currentStreamToken) {
         var retryBtn = document.createElement("button");
         retryBtn.className = "player-error-btn";
@@ -1395,7 +1367,6 @@ function getHTML(): string {
         });
         overlay.appendChild(retryBtn);
       }
-
       document.getElementById("player-inner").appendChild(overlay);
     }
 
@@ -1406,26 +1377,18 @@ function getHTML(): string {
 
     function play(streamToken) {
       if (!streamToken || typeof streamToken !== "string") return;
-
       currentStreamToken = streamToken;
-
-      // Build proxy URL using opaque token only (no original URL exposed)
       var proxyUrl = "/api/stream-proxy?token=" + encodeURIComponent(streamToken);
-
       document.getElementById("player-container").classList.remove("hidden");
       clearPlayerError();
       showPlayerLoading(true);
-
       var vid = document.getElementById("video");
-
       if (currentHls) {
         currentHls.destroy();
         currentHls = null;
       }
-
       vid.removeAttribute("src");
       vid.load();
-
       if (typeof Hls !== "undefined" && Hls.isSupported()) {
         var hls = new Hls({
           enableWorker: true,
@@ -1436,21 +1399,17 @@ function getHTML(): string {
         currentHls = hls;
         hls.loadSource(proxyUrl);
         hls.attachMedia(vid);
-
         hls.on(Hls.Events.MANIFEST_PARSED, function() {
           showPlayerLoading(false);
           vid.play().catch(function() {});
         });
-
         hls.on(Hls.Events.FRAG_LOADED, function() {
           showPlayerLoading(false);
         });
-
         hls.on(Hls.Events.ERROR, function(event, data) {
           if (data.fatal) {
             showPlayerLoading(false);
             if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
-              console.warn("HLS network error, attempting recovery...");
               hls.startLoad();
               setTimeout(function() {
                 if (vid.paused && vid.readyState < 3) {
@@ -1458,7 +1417,6 @@ function getHTML(): string {
                 }
               }, 10000);
             } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
-              console.warn("HLS media error, attempting recovery...");
               hls.recoverMediaError();
             } else {
               showPlayerError("Stream unavailable. Please try another server.");
@@ -1483,7 +1441,6 @@ function getHTML(): string {
         showPlayerLoading(false);
         showPlayerError("Your browser does not support HLS streaming.");
       }
-
       window.scrollTo({ top: 0, behavior: "smooth" });
     }
 
@@ -1516,16 +1473,13 @@ async function fetchServerURL(roomNum: any) {
     const roomStr = String(roomNum);
     if (!/^[a-zA-Z0-9_-]+$/.test(roomStr))
       return { m3u8: null, hdM3u8: null };
-
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 8000);
-
     const res = await fetch(`${ROOM_API_BASE}/room/${roomStr}/detail.json`, {
       headers: { "User-Agent": API_USER_AGENT, Referer: API_REFERER },
       signal: controller.signal,
     });
     clearTimeout(timeout);
-
     const txt = await res.text();
     const m = txt.match(/detail\((.*)\)/);
     if (m) {
@@ -1536,45 +1490,34 @@ async function fetchServerURL(roomNum: any) {
         return { m3u8, hdM3u8 };
       }
     }
-  } catch (_e) {
-    /* ignore */
-  }
+  } catch (_e) { /* ignore */ }
   return { m3u8: null, hdM3u8: null };
 }
 
 async function fetchMatches(date: string) {
   if (!/^\d{8}$/.test(date)) return [];
-
   try {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 10000);
-
     const res = await fetch(`${MATCH_API_BASE}/match/matches_${date}.json`, {
       headers: { "User-Agent": API_USER_AGENT, Referer: API_REFERER },
       signal: controller.signal,
     });
     clearTimeout(timeout);
-
     const txt = await res.text();
     const m = txt.match(/matches_\d+\((.*)\)/);
     if (!m) return [];
-
     const js = JSON.parse(m[1]);
     if (js.code !== 200) return [];
-
     const now = Date.now();
     const results = [];
-
     for (const it of js.data) {
       const mt = it.matchTime;
-
       if (!mt || typeof mt !== "number") continue;
-
       let status: string;
       if (now >= mt && now <= mt + 3 * 60 * 60 * 1000) status = "live";
       else if (now > mt + 3 * 60 * 60 * 1000) status = "finished";
       else status = "upcoming";
-
       const servers: any[] = [];
       if (status === "live" && it.anchors) {
         const anchorSlice = it.anchors.slice(0, 3);
@@ -1582,7 +1525,6 @@ async function fetchMatches(date: string) {
           const room = a.anchor?.roomNum;
           if (!room) continue;
           const { m3u8, hdM3u8 } = await fetchServerURL(room);
-          // Create opaque tokens instead of exposing real URLs
           if (m3u8) {
             const sdToken = createStreamToken(m3u8);
             servers.push({ name: "Soco SD", token: sdToken });
@@ -1601,6 +1543,19 @@ async function fetchMatches(date: string) {
         it.awayLogo || it.guestLogo || it.awayIcon || it.guestIcon
       );
 
+      // ===== NEW: Proxy logos through server =====
+      let homeLogoProxied: string | null = null;
+      let awayLogoProxied: string | null = null;
+      if (homeLogo) {
+        const logoToken = createStreamToken(homeLogo);
+        homeLogoProxied = "/api/img-proxy?token=" + logoToken;
+      }
+      if (awayLogo) {
+        const logoToken = createStreamToken(awayLogo);
+        awayLogoProxied = "/api/img-proxy?token=" + logoToken;
+      }
+      // ===== END NEW =====
+
       const homeTeamName = sanitizeText(
         it.homeName || it.hostName || "Home",
         50
@@ -1613,28 +1568,24 @@ async function fetchMatches(date: string) {
         it.leagueName || it.subCateName || "Unknown League",
         80
       );
-
       let matchScore: string | null = null;
       if (it.homeScore !== undefined && it.homeScore !== null) {
         const hs = String(it.homeScore).replace(/[^0-9]/g, "").slice(0, 3);
         const as = String(it.awayScore).replace(/[^0-9]/g, "").slice(0, 3);
         matchScore = `${hs} - ${as}`;
       }
-
       const matchDateStr = new Intl.DateTimeFormat("en-CA", {
         timeZone: "Asia/Yangon",
         year: "numeric",
         month: "2-digit",
         day: "2-digit",
       }).format(new Date(mt));
-
       const todayDateStr = new Intl.DateTimeFormat("en-CA", {
         timeZone: "Asia/Yangon",
         year: "numeric",
         month: "2-digit",
         day: "2-digit",
       }).format(new Date());
-
       const tomorrowD = new Date();
       tomorrowD.setDate(tomorrowD.getDate() + 1);
       const tomorrowDateStr = new Intl.DateTimeFormat("en-CA", {
@@ -1643,7 +1594,6 @@ async function fetchMatches(date: string) {
         month: "2-digit",
         day: "2-digit",
       }).format(tomorrowD);
-
       const yesterdayD = new Date();
       yesterdayD.setDate(yesterdayD.getDate() - 1);
       const yesterdayDateStr = new Intl.DateTimeFormat("en-CA", {
@@ -1652,7 +1602,6 @@ async function fetchMatches(date: string) {
         month: "2-digit",
         day: "2-digit",
       }).format(yesterdayD);
-
       let matchDay: string;
       if (matchDateStr === todayDateStr) {
         matchDay = "Today";
@@ -1663,7 +1612,6 @@ async function fetchMatches(date: string) {
       } else {
         matchDay = matchDateStr;
       }
-
       results.push({
         match_time: new Date(mt).toLocaleTimeString("en-US", {
           timeZone: "Asia/Yangon",
@@ -1675,8 +1623,8 @@ async function fetchMatches(date: string) {
         match_status: status,
         home_team_name: homeTeamName,
         away_team_name: awayTeamName,
-        home_team_logo: homeLogo,
-        away_team_logo: awayLogo,
+        home_team_logo: homeLogoProxied,   // Changed: now proxied
+        away_team_logo: awayLogoProxied,   // Changed: now proxied
         league_name: leagueName,
         match_score: matchScore,
         servers,
