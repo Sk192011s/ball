@@ -253,7 +253,6 @@ function getHTML(): string {
       overflow-x: hidden;
     }
 
-    /* Ambient background glow */
     body::before {
       content: '';
       position: fixed;
@@ -282,7 +281,6 @@ function getHTML(): string {
       z-index: 1;
     }
 
-    /* ===== HEADER ===== */
     .premium-header {
       background: linear-gradient(135deg, rgba(15,23,42,0.95) 0%, rgba(30,41,59,0.9) 100%);
       border-bottom: 1px solid rgba(255,255,255,0.06);
@@ -308,7 +306,6 @@ function getHTML(): string {
       text-transform: uppercase;
     }
 
-    /* ===== LIVE DOT ===== */
     .live-dot {
       width: 8px; height: 8px;
       background: #ef4444;
@@ -322,7 +319,6 @@ function getHTML(): string {
       50% { opacity: 0.5; transform: scale(0.7); }
     }
 
-    /* ===== CARDS ===== */
     .card {
       background: linear-gradient(145deg, rgba(30,41,59,0.7), rgba(15,23,42,0.8));
       border: 1px solid rgba(255,255,255,0.06);
@@ -357,7 +353,6 @@ function getHTML(): string {
       box-shadow: 0 0 40px rgba(239,68,68,0.1);
     }
 
-    /* ===== TEAM LOGOS ===== */
     .team-logo {
       width: 48px; height: 48px;
       border-radius: 50%;
@@ -379,7 +374,6 @@ function getHTML(): string {
       border: 2px solid rgba(255,255,255,0.08);
     }
 
-    /* ===== BUTTONS ===== */
     .btn-hd {
       background: linear-gradient(135deg, #ef4444, #dc2626);
       box-shadow: 0 4px 15px rgba(239,68,68,0.25);
@@ -416,7 +410,6 @@ function getHTML(): string {
     .btn-sd:hover { box-shadow: 0 6px 25px rgba(99,102,241,0.4); transform: translateY(-1px); }
     .btn-sd:active { transform: translateY(0); }
 
-    /* ===== SCORE BOX ===== */
     .score-box {
       background: rgba(0,0,0,0.5);
       border: 1px solid rgba(255,255,255,0.06);
@@ -425,7 +418,6 @@ function getHTML(): string {
       min-width: 80px;
     }
 
-    /* ===== LEAGUE BADGE ===== */
     .league-badge {
       background: linear-gradient(135deg, rgba(250,204,21,0.08), rgba(245,158,11,0.05));
       border: 1px solid rgba(250,204,21,0.15);
@@ -434,7 +426,6 @@ function getHTML(): string {
       font-weight: 600;
     }
 
-    /* ===== TABS ===== */
     .tab-btn {
       padding: 10px 22px;
       border-radius: 24px;
@@ -462,7 +453,6 @@ function getHTML(): string {
       border-color: rgba(255,255,255,0.15);
     }
 
-    /* ===== STAT PILLS ===== */
     .stat-pill {
       background: rgba(255,255,255,0.04);
       border: 1px solid rgba(255,255,255,0.06);
@@ -480,7 +470,6 @@ function getHTML(): string {
       display: inline-block;
     }
 
-    /* ===== LOADING ===== */
     .loading-spinner {
       width: 44px; height: 44px;
       border: 3px solid rgba(255,255,255,0.06);
@@ -491,7 +480,6 @@ function getHTML(): string {
     }
     @keyframes spin { to { transform: rotate(360deg); } }
 
-    /* ===== PLAYER ===== */
     .player-wrapper {
       border-radius: 20px;
       overflow: hidden;
@@ -507,13 +495,11 @@ function getHTML(): string {
       background: linear-gradient(135deg, #dc2626, #991b1b);
     }
 
-    /* ===== SCROLLBAR ===== */
     ::-webkit-scrollbar { width: 3px; height: 3px; }
     ::-webkit-scrollbar-track { background: transparent; }
     ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.08); border-radius: 4px; }
     ::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.15); }
 
-    /* ===== PAGE LOAD ANIMATION ===== */
     @keyframes fadeUp {
       from { opacity: 0; transform: translateY(12px); }
       to { opacity: 1; transform: translateY(0); }
@@ -523,7 +509,6 @@ function getHTML(): string {
     .fade-up-delay-2 { animation-delay: 0.2s; opacity: 0; }
     .fade-up-delay-3 { animation-delay: 0.3s; opacity: 0; }
 
-    /* ===== NO MATCHES ===== */
     .empty-state {
       text-align: center;
       padding: 60px 20px;
@@ -534,13 +519,6 @@ function getHTML(): string {
       opacity: 0.5;
     }
 
-    /* ===== MATCH DIVIDER ===== */
-    .match-divider {
-      height: 1px;
-      background: linear-gradient(90deg, transparent, rgba(255,255,255,0.04), transparent);
-    }
-
-    /* ===== STATUS BADGES ===== */
     .status-live {
       background: rgba(239,68,68,0.1);
       border: 1px solid rgba(239,68,68,0.2);
@@ -572,7 +550,6 @@ function getHTML(): string {
       font-weight: 600;
     }
 
-    /* ===== FOOTER SPACING ===== */
     .bottom-safe { height: 100px; }
   </style>
 </head>
@@ -649,7 +626,16 @@ function getHTML(): string {
     let currentFilter = 'all';
     let currentHls = null;
 
-    // Live clock
+    // ===== Stream URL storage (fixes the play issue) =====
+    const streamMap = {};
+    let streamIdx = 0;
+
+    function registerStream(url) {
+      const key = 's' + (streamIdx++);
+      streamMap[key] = url;
+      return key;
+    }
+
     function updateClock() {
       const now = new Date();
       const mmTime = now.toLocaleTimeString('en-US', {
@@ -673,7 +659,7 @@ function getHTML(): string {
         renderMatches();
       } catch (e) {
         document.getElementById('loading').innerHTML =
-          '<div class="empty-state"><div class="empty-state-icon">⚠️</div><div class="text-red-400 text-sm font-medium">' + e.message + '</div><div class="text-slate-600 text-xs mt-2">Pull to refresh or try again later</div></div>';
+          '<div class="empty-state"><div class="empty-state-icon">⚠️</div><div class="text-red-400 text-sm font-medium">' + escapeHtml(e.message) + '</div><div class="text-slate-600 text-xs mt-2">Pull to refresh or try again later</div></div>';
       }
     }
 
@@ -692,18 +678,18 @@ function getHTML(): string {
       renderMatches();
     }
 
+    function escapeHtml(str) {
+      const div = document.createElement('div');
+      div.textContent = str || '';
+      return div.innerHTML;
+    }
+
     function getLogoHTML(url, teamName) {
       if (url) {
-        return '<img src="' + url + '" alt="" class="team-logo" loading="lazy" onerror="this.style.display=\\'none\\';this.nextElementSibling.style.display=\\'flex\\';">' +
+        return '<img src="' + escapeHtml(url) + '" alt="" class="team-logo" loading="lazy" onerror="this.style.display=\\'none\\';this.nextElementSibling.style.display=\\'flex\\';">' +
                '<div class="team-logo-fallback" style="display:none;">⚽</div>';
       }
       return '<div class="team-logo-fallback">⚽</div>';
-    }
-
-    function escapeHtml(str) {
-      const div = document.createElement('div');
-      div.textContent = str;
-      return div.innerHTML;
     }
 
     function renderMatches() {
@@ -735,11 +721,12 @@ function getHTML(): string {
 
         let btns = '';
         if (m.servers && m.servers.length > 0) {
-          m.servers.forEach(s => {
-            const isHD = s.name.includes('HD');
-            const cls = isHD ? 'btn-hd' : 'btn-sd';
-            const label = isHD ? '▶ HD' : '▶ SD';
-            btns += '<button onclick="play(\\'' + encodeURIComponent(s.stream_url) + '\\')" class="' + cls + ' text-white text-[11px] px-5 py-2 rounded-full font-bold transition-all">' + label + '</button>';
+          m.servers.forEach(function(s) {
+            var key = registerStream(s.stream_url);
+            var isHD = s.name.indexOf('HD') !== -1;
+            var cls = isHD ? 'btn-hd' : 'btn-sd';
+            var label = isHD ? '▶ HD' : '▶ SD';
+            btns += '<button onclick="play(\\'' + key + '\\')" class="' + cls + ' text-white text-[11px] px-5 py-2 rounded-full font-bold transition-all">' + label + '</button>';
           });
         } else if (isLive) {
           btns = '<span class="text-[11px] text-amber-400/70 font-medium">⏳ Stream loading...</span>';
@@ -764,14 +751,14 @@ function getHTML(): string {
           '<div class="flex items-center justify-between">' +
             '<div class="flex flex-col items-center w-[30%] gap-2">' +
               homeLogo +
-              '<span class="text-[11px] font-semibold text-center leading-tight text-slate-200 line-clamp-2 w-full">' + escapeHtml(m.home_team_name) + '</span>' +
+              '<span class="text-[11px] font-semibold text-center leading-tight text-slate-200 w-full" style="display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;">' + escapeHtml(m.home_team_name) + '</span>' +
             '</div>' +
             '<div class="w-[30%] flex justify-center">' +
               scoreDisplay +
             '</div>' +
             '<div class="flex flex-col items-center w-[30%] gap-2">' +
               awayLogo +
-              '<span class="text-[11px] font-semibold text-center leading-tight text-slate-200 line-clamp-2 w-full">' + escapeHtml(m.away_team_name) + '</span>' +
+              '<span class="text-[11px] font-semibold text-center leading-tight text-slate-200 w-full" style="display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;">' + escapeHtml(m.away_team_name) + '</span>' +
             '</div>' +
           '</div>' +
           '<div class="text-center mt-4 pt-3 border-t border-white/[0.04] flex gap-2.5 justify-center">' +
@@ -782,10 +769,16 @@ function getHTML(): string {
       list.innerHTML = html;
     }
 
-    function play(encodedUrl) {
-      const url = decodeURIComponent(encodedUrl);
+    // ===== FIXED: Play using key lookup instead of inline URL =====
+    function play(key) {
+      var url = streamMap[key];
+      if (!url) {
+        console.error('Stream not found for key:', key);
+        return;
+      }
+
       document.getElementById('player-container').classList.remove('hidden');
-      const vid = document.getElementById('video');
+      var vid = document.getElementById('video');
 
       if (currentHls) {
         currentHls.destroy();
@@ -793,7 +786,7 @@ function getHTML(): string {
       }
 
       if (Hls.isSupported()) {
-        const hls = new Hls({
+        var hls = new Hls({
           enableWorker: true,
           lowLatencyMode: true,
           maxBufferLength: 30,
@@ -802,12 +795,12 @@ function getHTML(): string {
         currentHls = hls;
         hls.loadSource(url);
         hls.attachMedia(vid);
-        hls.on(Hls.Events.MANIFEST_PARSED, () => vid.play());
-        hls.on(Hls.Events.ERROR, (event, data) => {
+        hls.on(Hls.Events.MANIFEST_PARSED, function() { vid.play(); });
+        hls.on(Hls.Events.ERROR, function(event, data) {
           if (data.fatal) {
             console.error('HLS fatal error:', data.type);
             if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
-              hls.startLoad();
+              setTimeout(function() { hls.startLoad(); }, 2000);
             } else {
               hls.destroy();
             }
@@ -821,7 +814,7 @@ function getHTML(): string {
     }
 
     function closePlayer() {
-      const vid = document.getElementById('video');
+      var vid = document.getElementById('video');
       vid.pause();
       vid.removeAttribute('src');
       vid.load();
@@ -832,14 +825,13 @@ function getHTML(): string {
       document.getElementById('player-container').classList.add('hidden');
     }
 
-    // Initial load
     load();
-    // Auto-refresh every 60 seconds
     setInterval(load, 60000);
   </script>
 </body>
 </html>`;
 }
+
 
 // ====== BACKEND LOGIC ======
 
