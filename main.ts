@@ -13,23 +13,12 @@ const DEV_CONTACT_URL = Deno.env.get("DEV_CONTACT_URL") || "https://t.me/youruse
 const DEV_PROFILE_IMG = Deno.env.get("DEV_PROFILE_IMG") || "https://ui-avatars.com/api/?name=Dev&background=d97706&color=fff&size=128";
 const DEV_DISPLAY_NAME = Deno.env.get("DEV_DISPLAY_NAME") || "Developer";
 
-// ====== Allowed API Hostnames (whitelist for proxy) ======
-const ALLOWED_PROXY_HOSTS = new Set<string>();
-try {
-  if (MATCH_API_BASE) ALLOWED_PROXY_HOSTS.add(new URL(MATCH_API_BASE).hostname);
-  if (ROOM_API_BASE) ALLOWED_PROXY_HOSTS.add(new URL(ROOM_API_BASE).hostname);
-} catch (_) { /* ignore parse errors */ }
-// Add any additional CDN/stream hostnames your streams come from:
-const EXTRA_ALLOWED_HOSTS = Deno.env.get("ALLOWED_STREAM_HOSTS")?.split(",").map(h => h.trim()) || [];
-EXTRA_ALLOWED_HOSTS.forEach(h => { if (h) ALLOWED_PROXY_HOSTS.add(h); });
-
 // ====== SECURITY: Rate Limiter ======
 const rateLimitMap = new Map<string, { count: number; resetTime: number }>();
 const RATE_LIMIT_WINDOW = 60_000;
 const RATE_LIMIT_MAX = 60;
 const BLOCK_THRESHOLD = 200;
 const blockedIPs = new Map<string, number>();
-const MAX_TRACKED_IPS = 50_000; // Prevent memory exhaustion
 
 function getClientIP(req: Request): string {
   return (
@@ -52,10 +41,6 @@ function isRateLimited(ip: string): { limited: boolean; blocked: boolean } {
 
   const entry = rateLimitMap.get(ip);
   if (!entry || now > entry.resetTime) {
-    // Prevent memory exhaustion: if too many IPs tracked, clear old entries
-    if (rateLimitMap.size >= MAX_TRACKED_IPS) {
-      cleanupRateLimitMaps();
-    }
     rateLimitMap.set(ip, { count: 1, resetTime: now + RATE_LIMIT_WINDOW });
     return { limited: false, blocked: false };
   }
@@ -64,7 +49,6 @@ function isRateLimited(ip: string): { limited: boolean; blocked: boolean } {
 
   if (entry.count > BLOCK_THRESHOLD) {
     blockedIPs.set(ip, now + 10 * 60_000);
-    rateLimitMap.delete(ip);
     return { limited: true, blocked: true };
   }
 
@@ -75,7 +59,8 @@ function isRateLimited(ip: string): { limited: boolean; blocked: boolean } {
   return { limited: false, blocked: false };
 }
 
-function cleanupRateLimitMaps() {
+// Clean up stale entries periodically
+setInterval(() => {
   const now = Date.now();
   for (const [ip, entry] of rateLimitMap) {
     if (now > entry.resetTime) rateLimitMap.delete(ip);
@@ -83,10 +68,7 @@ function cleanupRateLimitMaps() {
   for (const [ip, expiry] of blockedIPs) {
     if (now > expiry) blockedIPs.delete(ip);
   }
-}
-
-// Clean up stale entries periodically
-setInterval(cleanupRateLimitMaps, 5 * 60_000);
+}, 5 * 60_000);
 
 // ====== SECURITY: Suspicious Request Detection ======
 function isSuspiciousRequest(req: Request): boolean {
@@ -106,10 +88,8 @@ function isSuspiciousRequest(req: Request): boolean {
   if (botPatterns.some((p) => p.test(ua))) return true;
 
   const path = url.pathname;
-  if (path.includes("..") || path.includes("//") || path.includes("\\")) return true;
-
-  // Block null bytes in any part of the URL
-  if (url.href.includes("\x00") || url.href.includes("%00")) return true;
+  if (path.includes("..") || path.includes("//") || path.includes("\\"))
+    return true;
 
   const maliciousPaths = [
     /\.env/i, /\.git/i, /wp-admin/i, /wp-login/i,
@@ -150,67 +130,12 @@ function securityHeaders(): Record<string, string> {
   };
 }
 
-// ====== SECURITY: Validate proxy target URL (anti-SSRF) ======
-function isAllowedProxyUrl(targetUrl: string): boolean {
-  try {
-    const parsed = new URL(targetUrl);
-
-    // Only allow http/https
-    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return false;
-
-    const hostname = parsed.hostname.toLowerCase();
-
-    // Block private/internal IPs
-    if (
-      hostname === "localhost" ||
-      hostname === "127.0.0.1" ||
-      hostname === "0.0.0.0" ||
-      hostname === "[::1]" ||
-      hostname.startsWith("10.") ||
-      hostname.startsWith("192.168.") ||
-      hostname.startsWith("169.254.") ||
-      hostname.endsWith(".local") ||
-      hostname.endsWith(".internal") ||
-      /^172\.(1[6-9]|2\d|3[01])\./.test(hostname) ||
-      /^0\./.test(hostname) ||
-      /^\[?fe80:/i.test(hostname) ||
-      /^\[?fd[0-9a-f]{2}:/i.test(hostname) ||
-      /^\[?fc[0-9a-f]{2}:/i.test(hostname)
-    ) {
-      return false;
-    }
-
-    // Block cloud metadata endpoints
-    if (
-      hostname === "metadata.google.internal" ||
-      hostname === "metadata.google.com" ||
-      hostname === "169.254.169.254"
-    ) {
-      return false;
-    }
-
-    // If we have a whitelist configured, enforce it
-    // (skip whitelist check if no hosts are configured, for flexibility)
-    if (ALLOWED_PROXY_HOSTS.size > 0) {
-      // Allow if hostname or a parent domain is whitelisted
-      const isWhitelisted = [...ALLOWED_PROXY_HOSTS].some(allowed => {
-        return hostname === allowed || hostname.endsWith("." + allowed);
-      });
-      if (!isWhitelisted) return false;
-    }
-
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 // ====== SECURITY: Sanitize URL (only allow http/https) ======
 function sanitizeUrl(url: string | null | undefined): string | null {
   if (!url || typeof url !== "string") return null;
   const trimmed = url.trim();
   if (/^https?:\/\//i.test(trimmed)) {
-    return trimmed.replace(/[<>"'`\s\x00-\x1f]/g, "");
+    return trimmed.replace(/[<>"'`\s]/g, "");
   }
   return null;
 }
@@ -236,11 +161,6 @@ async function handleStreamProxy(req: Request, url: URL): Promise<Response> {
     return new Response("Invalid URL", { status: 400, headers: securityHeaders() });
   }
 
-  // SSRF protection: block internal/private addresses
-  if (!isAllowedProxyUrl(streamUrl)) {
-    return new Response("Forbidden URL target", { status: 403, headers: securityHeaders() });
-  }
-
   try {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 15000);
@@ -250,7 +170,6 @@ async function handleStreamProxy(req: Request, url: URL): Promise<Response> {
         "User-Agent": API_USER_AGENT,
         Referer: API_REFERER,
       },
-      redirect: "follow",
       signal: controller.signal,
     });
     clearTimeout(timeout);
@@ -259,24 +178,11 @@ async function handleStreamProxy(req: Request, url: URL): Promise<Response> {
       return new Response("Stream unavailable", { status: 502, headers: securityHeaders() });
     }
 
-    // Validate that redirected URL is also safe
-    if (proxyRes.url && proxyRes.url !== streamUrl) {
-      if (!isAllowedProxyUrl(proxyRes.url)) {
-        return new Response("Forbidden redirect target", { status: 403, headers: securityHeaders() });
-      }
-    }
-
     const contentType = proxyRes.headers.get("content-type") || "";
     const body = proxyRes.body;
 
     if (streamUrl.endsWith(".m3u8") || contentType.includes("mpegurl") || contentType.includes("m3u8")) {
       const text = await proxyRes.text();
-
-      // Limit m3u8 file size to prevent abuse
-      if (text.length > 1024 * 1024) {
-        return new Response("Playlist too large", { status: 413, headers: securityHeaders() });
-      }
-
       const baseUrl = streamUrl.substring(0, streamUrl.lastIndexOf("/") + 1);
 
       const rewritten = text.split("\n").map((line: string) => {
@@ -320,25 +226,14 @@ async function handleStreamProxy(req: Request, url: URL): Promise<Response> {
       headers: resHeaders,
     });
   } catch (e: any) {
-    if (e.name === "AbortError") {
-      return new Response("Stream timeout", { status: 504, headers: securityHeaders() });
-    }
     console.warn("Stream proxy error:", e.message);
     return new Response("Stream error", { status: 502, headers: securityHeaders() });
   }
 }
 
-// ====== Valid API routes ======
-const VALID_ROUTES = new Set(["/", "/api/matches", "/api/stream-proxy"]);
-
 serve(async (req) => {
   const url = new URL(req.url);
   const clientIP = getClientIP(req);
-
-  // Only allow known routes
-  if (!VALID_ROUTES.has(url.pathname)) {
-    return new Response("Not Found", { status: 404, headers: securityHeaders() });
-  }
 
   const { limited, blocked } = isRateLimited(clientIP);
   if (blocked) {
@@ -406,8 +301,10 @@ serve(async (req) => {
       allMatches.sort((a, b) => {
         if (a.match_status === "live" && b.match_status !== "live") return -1;
         if (a.match_status !== "live" && b.match_status === "live") return 1;
-        if (a.match_status === "upcoming" && b.match_status === "finished") return -1;
-        if (a.match_status === "finished" && b.match_status === "upcoming") return 1;
+        if (a.match_status === "upcoming" && b.match_status === "finished")
+          return -1;
+        if (a.match_status === "finished" && b.match_status === "upcoming")
+          return 1;
         return 0;
       });
 
@@ -948,13 +845,13 @@ function getHTML(): string {
         var now = new Date();
         var mmTime = now.toLocaleTimeString("en-US", {
           timeZone: "Asia/Yangon",
-          hour: "2-digit", minute: "2-digit", hour12: true
+          hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: true
         });
         document.getElementById("clock").textContent = mmTime;
       } catch(e) {}
     }
     updateClock();
-    setInterval(updateClock, 30000);
+    setInterval(updateClock, 1000);
 
     document.getElementById("tabs").addEventListener("click", function(e) {
       var btn = e.target.closest(".tab-btn");
@@ -1322,7 +1219,7 @@ async function fetchServerURL(roomNum: any) {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 8000);
 
-    const res = await fetch(`${ROOM_API_BASE}/room/${encodeURIComponent(roomStr)}/detail.json`, {
+    const res = await fetch(`${ROOM_API_BASE}/room/${roomStr}/detail.json`, {
       headers: { "User-Agent": API_USER_AGENT, Referer: API_REFERER },
       signal: controller.signal,
     });
@@ -1362,21 +1259,15 @@ async function fetchMatches(date: string) {
     if (!m) return [];
 
     const js = JSON.parse(m[1]);
-    if (js.code !== 200 || !Array.isArray(js.data)) return [];
+    if (js.code !== 200) return [];
 
     const now = Date.now();
     const results = [];
 
-    // Limit number of matches processed to prevent abuse
-    const maxMatches = 500;
-    const data = js.data.slice(0, maxMatches);
-
-    for (const it of data) {
+    for (const it of js.data) {
       const mt = it.matchTime;
 
       if (!mt || typeof mt !== "number") continue;
-      // Sanity check: timestamp should be within reasonable range (±7 days)
-      if (Math.abs(mt - now) > 7 * 24 * 60 * 60 * 1000) continue;
 
       let status: string;
       if (now >= mt && now <= mt + 3 * 60 * 60 * 1000) status = "live";
@@ -1384,7 +1275,7 @@ async function fetchMatches(date: string) {
       else status = "upcoming";
 
       const servers: any[] = [];
-      if (status === "live" && it.anchors && Array.isArray(it.anchors)) {
+      if (status === "live" && it.anchors) {
         const anchorSlice = it.anchors.slice(0, 3);
         for (const a of anchorSlice) {
           const room = a.anchor?.roomNum;
