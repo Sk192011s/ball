@@ -1,5 +1,11 @@
 import { serve } from "https://deno.land/std@0.208.0/http/server.ts";
 
+// ====== Environment Variables ======
+const MATCH_API_BASE = Deno.env.get("MATCH_API_BASE") || "";
+const ROOM_API_BASE = Deno.env.get("ROOM_API_BASE") || "";
+const API_REFERER = Deno.env.get("API_REFERER") || "";
+const API_USER_AGENT = Deno.env.get("API_USER_AGENT") || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36";
+
 serve(async (req) => {
   const url = new URL(req.url);
 
@@ -16,12 +22,10 @@ serve(async (req) => {
       };
 
       const dates = [getVNDate(-1), getVNDate(0), getVNDate(1)];
-      const referer = "https://socolivev.co/";
-      const agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36";
 
       let allMatches: any[] = [];
       for (const d of dates) {
-        const matches = await fetchMatches(d, referer, agent);
+        const matches = await fetchMatches(d);
         allMatches = allMatches.concat(matches);
       }
 
@@ -355,7 +359,6 @@ function getHTML(): string {
       document.getElementById('player-container').classList.remove('hidden');
       const vid = document.getElementById('video');
 
-      // Destroy previous HLS instance
       if (currentHls) {
         currentHls.destroy();
         currentHls = null;
@@ -393,7 +396,6 @@ function getHTML(): string {
     }
 
     load();
-    // Auto refresh every 60 seconds
     setInterval(load, 60000);
   </script>
 </body>
@@ -404,8 +406,8 @@ function getHTML(): string {
 
 async function fetchServerURL(roomNum: any) {
   try {
-    const res = await fetch(`https://json.vnres.co/room/${roomNum}/detail.json`, {
-      headers: { "User-Agent": "Mozilla/5.0", "Referer": "https://socolivev.co/" }
+    const res = await fetch(`${ROOM_API_BASE}/room/${roomNum}/detail.json`, {
+      headers: { "User-Agent": API_USER_AGENT, "Referer": API_REFERER }
     });
     const txt = await res.text();
     const m = txt.match(/detail\((.*)\)/);
@@ -419,10 +421,10 @@ async function fetchServerURL(roomNum: any) {
   return { m3u8: null, hdM3u8: null };
 }
 
-async function fetchMatches(date: string, referer: string, agent: string) {
+async function fetchMatches(date: string) {
   try {
-    const res = await fetch(`https://json.vnres.co/match/matches_${date}.json`, {
-      headers: { "User-Agent": agent, "Referer": referer }
+    const res = await fetch(`${MATCH_API_BASE}/match/matches_${date}.json`, {
+      headers: { "User-Agent": API_USER_AGENT, "Referer": API_REFERER }
     });
     const txt = await res.text();
     const m = txt.match(/matches_\d+\((.*)\)/);
@@ -451,7 +453,6 @@ async function fetchMatches(date: string, referer: string, agent: string) {
         }
       }
 
-      // ✅ Logo URLs ယူထားတယ် (API response ထဲက field names အမျိုးမျိုးကို စစ်ပေးတယ်)
       const homeLogo = it.homeLogo || it.hostLogo || it.homeIcon || it.hostIcon || null;
       const awayLogo = it.awayLogo || it.guestLogo || it.awayIcon || it.guestIcon || null;
 
