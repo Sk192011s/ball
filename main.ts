@@ -77,8 +77,8 @@ const streamRateLimitMap = new Map<
 >();
 const RATE_LIMIT_WINDOW = 60_000;
 const RATE_LIMIT_MAX = 60;
-const STREAM_RATE_LIMIT_MAX = 120;
-const BLOCK_THRESHOLD = 200;
+const STREAM_RATE_LIMIT_MAX = 300; // Increased from 120 — HLS fetches many segments
+const BLOCK_THRESHOLD = 500; // Increased from 200
 const blockedIPs = new Map<string, number>();
 
 function getClientIP(req: Request): string {
@@ -287,6 +287,7 @@ function isValidProxyReferer(req: Request): boolean {
       if (origUrl.host === host) return true;
     } catch { /* ignore */ }
   }
+  // Allow requests with no referer/origin (HLS player internal requests)
   if (!referer && !origin) return true;
   return false;
 }
@@ -326,7 +327,7 @@ async function handleStreamProxy(
   }
   try {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 15000);
+    const timeout = setTimeout(() => controller.abort(), 25000); // Increased from 15s to 25s
     const proxyRes = await fetch(streamUrl, {
       headers: {
         "User-Agent": API_USER_AGENT,
@@ -420,7 +421,7 @@ async function handleStreamProxy(
         headers: {
           "Content-Type": "application/vnd.apple.mpegurl",
           "Access-Control-Allow-Origin": "*",
-          "Cache-Control": "no-cache",
+          "Cache-Control": "no-cache, no-store", // Never cache live m3u8
           ...securityHeaders(),
         },
       });
@@ -434,7 +435,7 @@ async function handleStreamProxy(
     }
     const resHeaders: Record<string, string> = {
       "Access-Control-Allow-Origin": "*",
-      "Cache-Control": "public, max-age=10",
+      "Cache-Control": "public, max-age=60", // Segments can be cached longer
       ...securityHeaders(),
     };
     if (contentType) {
@@ -589,9 +590,10 @@ serve(async (req) => {
           .replace(/-/g, "");
       };
       const dates = [getVNDate(-1), getVNDate(0), getVNDate(1)];
+      // Fetch all dates concurrently
+      const allResults = await Promise.all(dates.map((d) => fetchMatches(d)));
       let allMatches: any[] = [];
-      for (const d of dates) {
-        const matches = await fetchMatches(d);
+      for (const matches of allResults) {
         allMatches = allMatches.concat(matches);
       }
       allMatches.sort((a, b) => {
@@ -775,7 +777,6 @@ function getHTML(): string {
       box-shadow: 0 0 30px rgba(239,68,68,0.08);
     }
 
-    /* ===== NEW: Active/Now-Playing card highlight ===== */
     .card-now-playing {
       border-color: rgba(217,119,6,0.5) !important;
       box-shadow: 0 0 0 2px rgba(217,119,6,0.15), 0 8px 32px rgba(217,119,6,0.12) !important;
@@ -822,7 +823,6 @@ function getHTML(): string {
       0%, 100% { transform: scaleY(1); }
       50% { transform: scaleY(0.4); }
     }
-    /* ===== END NEW ===== */
 
     .team-logo {
       width: 48px; height: 48px;
@@ -958,7 +958,6 @@ function getHTML(): string {
       box-shadow: 0 20px 60px rgba(0,0,0,0.15);
     }
 
-    /* ===== NEW: Now-playing info bar above close button ===== */
     .player-now-info {
       background: linear-gradient(135deg, #1e293b, #0f172a);
       padding: 8px 16px;
@@ -976,7 +975,6 @@ function getHTML(): string {
       font-size: 10px;
       font-weight: 500;
     }
-    /* ===== END NEW ===== */
 
     .close-btn {
       background: linear-gradient(135deg, #1e293b, #0f172a);
@@ -1197,8 +1195,16 @@ function getHTML(): string {
     var currentFilter = "all";
     var currentHls = null;
     var currentStreamToken = null;
-    var currentMatchIndex = -1; // NEW: track which match is playing
-    var playIdCounter = 0; // NEW: unique id per play() call to handle race conditions
+    var currentMatchId = null; // CHANGED: use unique match ID instead of index
+    var playIdCounter = 0;
+    var isPlayerActive = false; // NEW: track if player is actively playing
+    var hlsRecoveryCount = 0; // NEW: track recovery attempts
+    var MAX_RECOVERY = 5; // NEW: max auto-recovery attempts
+
+    // NEW: Generate a unique ID for each match to track across data refreshes
+    function getMatchId(m) {
+      return (m.home_team_name || "") + "|" + (m.away_team_name || "") + "|" + (m.league_name || "") + "|" + (m.match_time || "");
+    }
 
     function escapeHtml(str) {
       if (typeof str !== "string") return "";
@@ -1233,10 +1239,14 @@ function getHTML(): string {
         updateStats();
         renderMatches();
       } catch (e) {
-        document.getElementById("loading").innerHTML =
-          '<div class="empty-state"><div class="empty-state-icon">⚠️</div>' +
-          '<div class="text-red-500 text-sm font-medium">' + escapeHtml(e.message) + '</div>' +
-          '<div class="text-slate-400 text-xs mt-2">Pull to refresh or try again later</div></div>';
+        // Only show error if we have no data at all
+        if (allData.length === 0) {
+          document.getElementById("loading").innerHTML =
+            '<div class="empty-state"><div class="empty-state-icon">⚠️</div>' +
+            '<div class="text-red-500 text-sm font-medium">' + escapeHtml(e.message) + '</div>' +
+            '<div class="text-slate-400 text-xs mt-2">Pull to refresh or try again later</div></div>';
+        }
+        // If we already have data, silently ignore the error — keep showing existing matches
       }
     }
 
@@ -1276,16 +1286,25 @@ function getHTML(): string {
       return "day-other";
     }
 
-    // NEW: Update the now-playing info bar under the player
     function updatePlayerInfo() {
       var infoEl = document.getElementById("player-now-info");
       var teamsEl = document.getElementById("player-now-teams");
       var leagueEl = document.getElementById("player-now-league");
-      if (currentMatchIndex >= 0 && currentMatchIndex < allData.length) {
-        var m = allData[currentMatchIndex];
-        teamsEl.textContent = (m.home_team_name || "Home") + "  vs  " + (m.away_team_name || "Away");
-        leagueEl.textContent = m.league_name || "";
-        infoEl.classList.remove("hidden");
+      if (currentMatchId && allData.length > 0) {
+        var m = null;
+        for (var i = 0; i < allData.length; i++) {
+          if (getMatchId(allData[i]) === currentMatchId) {
+            m = allData[i];
+            break;
+          }
+        }
+        if (m) {
+          teamsEl.textContent = (m.home_team_name || "Home") + "  vs  " + (m.away_team_name || "Away");
+          leagueEl.textContent = m.league_name || "";
+          infoEl.classList.remove("hidden");
+        } else {
+          infoEl.classList.add("hidden");
+        }
       } else {
         infoEl.classList.add("hidden");
       }
@@ -1312,9 +1331,8 @@ function getHTML(): string {
         var isLive = m.match_status === "live";
         var isFinished = m.match_status === "finished";
 
-        // Find original index in allData for this match
-        var originalIndex = allData.indexOf(m);
-        var isNowPlaying = (originalIndex === currentMatchIndex && currentStreamToken !== null);
+        var matchId = getMatchId(m);
+        var isNowPlaying = (matchId === currentMatchId && isPlayerActive);
 
         var matchDay = m.match_day || "Today";
         if (matchDay !== lastDay) {
@@ -1332,7 +1350,6 @@ function getHTML(): string {
         if (isNowPlaying) {
           card.className += " card-now-playing";
         }
-        card.setAttribute("data-match-index", String(originalIndex));
         card.style.animation = "fadeUp 0.4s ease-out " + (idx * 0.05) + "s both";
 
         var headerRow = document.createElement("div");
@@ -1346,7 +1363,6 @@ function getHTML(): string {
         leagueBadge.textContent = m.league_name || "Unknown";
         headerLeft.appendChild(leagueBadge);
 
-        // NOW PLAYING badge (hidden by default, shown via CSS when card has card-now-playing)
         var nowBadge = document.createElement("span");
         nowBadge.className = "now-playing-badge";
         nowBadge.innerHTML = '<span class="now-playing-icon"><span></span><span></span><span></span></span> NOW';
@@ -1420,9 +1436,9 @@ function getHTML(): string {
             btn.className = (isHD ? "btn-hd" : "btn-sd") + " text-white text-[11px] px-5 py-2 rounded-full font-bold transition-all";
             btn.textContent = isHD ? "▶ HD" : "▶ SD";
             btn.setAttribute("data-stream-token", s.token);
-            btn.setAttribute("data-match-index", String(originalIndex));
+            btn.setAttribute("data-match-id", matchId);
             btn.addEventListener("click", function() {
-              play(this.getAttribute("data-stream-token"), parseInt(this.getAttribute("data-match-index")));
+              play(this.getAttribute("data-stream-token"), this.getAttribute("data-match-id"));
             });
             btnsRow.appendChild(btn);
           });
@@ -1471,7 +1487,8 @@ function getHTML(): string {
         retryBtn.textContent = "Retry";
         retryBtn.addEventListener("click", function() {
           overlay.remove();
-          play(currentStreamToken, currentMatchIndex);
+          hlsRecoveryCount = 0; // reset recovery count on manual retry
+          play(currentStreamToken, currentMatchId);
         });
         overlay.appendChild(retryBtn);
       }
@@ -1491,62 +1508,68 @@ function getHTML(): string {
       }
       vid.pause();
       vid.removeAttribute("src");
-      try { vid.load(); } catch(e) {}
+      vid.load();
       clearPlayerError();
       showPlayerLoading(false);
     }
 
-    function play(streamToken, matchIndex) {
+    function play(streamToken, matchId) {
       if (!streamToken || typeof streamToken !== "string") return;
 
-      // Increment play ID to invalidate any previous in-flight play
       playIdCounter++;
       var thisPlayId = playIdCounter;
+      hlsRecoveryCount = 0;
 
-      // Fully destroy previous player first
       destroyCurrentPlayer();
 
       currentStreamToken = streamToken;
-      currentMatchIndex = (typeof matchIndex === "number") ? matchIndex : -1;
+      currentMatchId = matchId || null;
+      isPlayerActive = true;
 
-      // Update UI: show player, highlight card, show match info
       document.getElementById("player-container").classList.remove("hidden");
       clearPlayerError();
       showPlayerLoading(true);
       updatePlayerInfo();
-      renderMatches(); // re-render to highlight the now-playing card
+      renderMatches();
 
       var vid = document.getElementById("video");
       var proxyUrl = "/api/stream-proxy?token=" + encodeURIComponent(streamToken);
 
-      // Small delay to let the video element fully reset after load()
       setTimeout(function() {
-        // Check if this play call is still the current one
         if (thisPlayId !== playIdCounter) return;
 
         if (typeof Hls !== "undefined" && Hls.isSupported()) {
           var hls = new Hls({
             enableWorker: true,
-            lowLatencyMode: true,
+            lowLatencyMode: false, // CHANGED: disable low latency for stability
             maxBufferLength: 30,
-            maxMaxBufferLength: 60,
-            manifestLoadingTimeOut: 15000,
-            manifestLoadingMaxRetry: 3,
-            manifestLoadingRetryDelay: 1000,
-            levelLoadingTimeOut: 15000,
-            levelLoadingMaxRetry: 3,
-            levelLoadingRetryDelay: 1000,
-            fragLoadingTimeOut: 20000,
-            fragLoadingMaxRetry: 5,
-            fragLoadingRetryDelay: 1000
+            maxMaxBufferLength: 120, // INCREASED from 60
+            maxBufferHole: 1.0, // NEW: allow up to 1s gaps
+            highBufferWatchdogPeriod: 3, // NEW: check buffer health every 3s
+            manifestLoadingTimeOut: 20000, // INCREASED from 15s
+            manifestLoadingMaxRetry: 6, // INCREASED from 3
+            manifestLoadingRetryDelay: 1500, // INCREASED from 1s
+            levelLoadingTimeOut: 20000, // INCREASED from 15s
+            levelLoadingMaxRetry: 6, // INCREASED from 3
+            levelLoadingRetryDelay: 1500,
+            fragLoadingTimeOut: 30000, // INCREASED from 20s
+            fragLoadingMaxRetry: 8, // INCREASED from 5
+            fragLoadingRetryDelay: 1500, // INCREASED from 1s
+            startFragPrefetch: true, // NEW: prefetch next fragment
+            testBandwidth: true,
+            progressive: true,
+            backBufferLength: 30 // NEW: keep 30s back buffer
           });
           currentHls = hls;
 
           hls.loadSource(proxyUrl);
           hls.attachMedia(vid);
 
+          var manifestLoaded = false;
+
           hls.on(Hls.Events.MANIFEST_PARSED, function() {
             if (thisPlayId !== playIdCounter) return;
+            manifestLoaded = true;
             showPlayerLoading(false);
             vid.play().catch(function() {});
           });
@@ -1556,49 +1579,146 @@ function getHTML(): string {
             showPlayerLoading(false);
           });
 
+          // NEW: Handle buffer stalls — auto-recover
+          hls.on(Hls.Events.BUFFER_STALLED_ERROR, function() {
+            if (thisPlayId !== playIdCounter) return;
+            console.warn("HLS buffer stalled, attempting recovery...");
+            // Don't show loading spinner for brief stalls
+          });
+
+          // NEW: Handle when fragments are changed/parsed
+          hls.on(Hls.Events.FRAG_CHANGED, function() {
+            if (thisPlayId !== playIdCounter) return;
+            // Stream is healthy — hide any loading
+            showPlayerLoading(false);
+            clearPlayerError();
+          });
+
           hls.on(Hls.Events.ERROR, function(event, data) {
             if (thisPlayId !== playIdCounter) return;
+
+            console.warn("HLS error:", data.type, data.details, "fatal:", data.fatal);
+
             if (data.fatal) {
-              showPlayerLoading(false);
               if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
-                // Auto retry up to a point
-                hls.startLoad();
-                setTimeout(function() {
-                  if (thisPlayId !== playIdCounter) return;
-                  if (vid.paused && vid.readyState < 3) {
-                    showPlayerError("Stream connection failed. Please try another server.");
-                  }
-                }, 12000);
+                hlsRecoveryCount++;
+                if (hlsRecoveryCount <= MAX_RECOVERY) {
+                  console.warn("HLS network error, recovery attempt " + hlsRecoveryCount + "/" + MAX_RECOVERY);
+                  // Show loading during recovery but not error
+                  showPlayerLoading(true);
+                  // Wait a bit then retry
+                  setTimeout(function() {
+                    if (thisPlayId !== playIdCounter) return;
+                    try {
+                      hls.startLoad();
+                    } catch(e) {}
+                  }, 2000 * hlsRecoveryCount); // Exponential backoff
+                } else {
+                  showPlayerLoading(false);
+                  showPlayerError("Stream connection lost. Please try again.");
+                }
               } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
-                hls.recoverMediaError();
+                hlsRecoveryCount++;
+                if (hlsRecoveryCount <= MAX_RECOVERY) {
+                  console.warn("HLS media error, recovery attempt " + hlsRecoveryCount + "/" + MAX_RECOVERY);
+                  showPlayerLoading(true);
+                  try {
+                    hls.recoverMediaError();
+                  } catch(e) {}
+                  setTimeout(function() {
+                    if (thisPlayId !== playIdCounter) return;
+                    showPlayerLoading(false);
+                    vid.play().catch(function() {});
+                  }, 2000);
+                } else {
+                  showPlayerLoading(false);
+                  showPlayerError("Media error. Please try another server.");
+                }
               } else {
+                showPlayerLoading(false);
                 showPlayerError("Stream unavailable. Please try another server.");
-                hls.destroy();
+                try { hls.destroy(); } catch(e) {}
                 if (thisPlayId === playIdCounter) {
                   currentHls = null;
                 }
               }
+            } else {
+              // Non-fatal errors — just log, HLS.js handles internally
+              // But if we see too many non-fatal errors in a row, the fatal ones above will catch it
             }
           });
+
+          // NEW: Timeout fallback — if nothing loads after 20s, show error
+          setTimeout(function() {
+            if (thisPlayId !== playIdCounter) return;
+            if (!manifestLoaded) {
+              showPlayerLoading(false);
+              showPlayerError("Stream took too long to load. Please try another server.");
+            }
+          }, 20000);
+
         } else if (vid.canPlayType("application/vnd.apple.mpegurl")) {
+          // Safari / native HLS
           vid.src = proxyUrl;
+
+          var nativeLoaded = false;
+
           vid.addEventListener("loadeddata", function onLoaded() {
             if (thisPlayId !== playIdCounter) return;
+            nativeLoaded = true;
             showPlayerLoading(false);
             vid.removeEventListener("loadeddata", onLoaded);
           });
+
+          vid.addEventListener("canplay", function onCanPlay() {
+            if (thisPlayId !== playIdCounter) return;
+            nativeLoaded = true;
+            showPlayerLoading(false);
+            vid.removeEventListener("canplay", onCanPlay);
+          });
+
           vid.addEventListener("error", function onError() {
             if (thisPlayId !== playIdCounter) return;
             showPlayerLoading(false);
             showPlayerError("Stream unavailable. Please try another server.");
             vid.removeEventListener("error", onError);
           });
+
+          // NEW: Handle stalls on native player
+          vid.addEventListener("waiting", function onWaiting() {
+            if (thisPlayId !== playIdCounter) {
+              vid.removeEventListener("waiting", onWaiting);
+              return;
+            }
+            // Only show loading if stalled for more than 3s
+            var stallTimer = setTimeout(function() {
+              if (thisPlayId !== playIdCounter) return;
+              if (vid.readyState < 3) {
+                showPlayerLoading(true);
+              }
+            }, 3000);
+            vid.addEventListener("playing", function onPlaying() {
+              clearTimeout(stallTimer);
+              showPlayerLoading(false);
+              vid.removeEventListener("playing", onPlaying);
+            }, { once: true });
+          });
+
           vid.play().catch(function() {});
+
+          setTimeout(function() {
+            if (thisPlayId !== playIdCounter) return;
+            if (!nativeLoaded) {
+              showPlayerLoading(false);
+              showPlayerError("Stream took too long to load. Please try another server.");
+            }
+          }, 20000);
+
         } else {
           showPlayerLoading(false);
           showPlayerError("Your browser does not support HLS streaming.");
         }
-      }, 100); // 100ms delay for clean reset
+      }, 150);
 
       window.scrollTo({ top: 0, behavior: "smooth" });
     }
@@ -1606,14 +1726,42 @@ function getHTML(): string {
     function closePlayer() {
       destroyCurrentPlayer();
       currentStreamToken = null;
-      currentMatchIndex = -1;
+      currentMatchId = null;
+      isPlayerActive = false;
+      hlsRecoveryCount = 0;
       document.getElementById("player-container").classList.add("hidden");
       document.getElementById("player-now-info").classList.add("hidden");
-      renderMatches(); // re-render to remove now-playing highlight
+      renderMatches();
     }
 
+    // NEW: Handle video element stall events for HLS.js too
+    (function() {
+      var vid = document.getElementById("video");
+
+      // When video stalls (buffering), show loading after a delay
+      vid.addEventListener("waiting", function() {
+        if (!isPlayerActive) return;
+        showPlayerLoading(true);
+      });
+
+      // When video resumes playing, hide loading
+      vid.addEventListener("playing", function() {
+        if (!isPlayerActive) return;
+        showPlayerLoading(false);
+        clearPlayerError();
+      });
+
+      // When video can play through, hide loading
+      vid.addEventListener("canplaythrough", function() {
+        if (!isPlayerActive) return;
+        showPlayerLoading(false);
+      });
+    })();
+
     load();
-    setInterval(load, 60000);
+    setInterval(function() {
+      load();
+    }, 60000);
   <\/script>
 </body>
 </html>`;
@@ -1627,7 +1775,7 @@ async function fetchServerURL(roomNum: any) {
     if (!/^[a-zA-Z0-9_-]+$/.test(roomStr))
       return { m3u8: null, hdM3u8: null };
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 8000);
+    const timeout = setTimeout(() => controller.abort(), 10000); // Increased from 8s
     const res = await fetch(`${ROOM_API_BASE}/room/${roomStr}/detail.json`, {
       headers: { "User-Agent": API_USER_AGENT, Referer: API_REFERER },
       signal: controller.signal,
@@ -1651,7 +1799,7 @@ async function fetchMatches(date: string) {
   if (!/^\d{8}$/.test(date)) return [];
   try {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 10000);
+    const timeout = setTimeout(() => controller.abort(), 15000); // Increased from 10s
     const res = await fetch(`${MATCH_API_BASE}/match/matches_${date}.json`, {
       headers: { "User-Agent": API_USER_AGENT, Referer: API_REFERER },
       signal: controller.signal,
@@ -1664,30 +1812,60 @@ async function fetchMatches(date: string) {
     if (js.code !== 200) return [];
     const now = Date.now();
     const results = [];
-    for (const it of js.data) {
+
+    // Collect all rooms to fetch concurrently
+    const roomFetchPromises: { matchIdx: number; room: any; anchorIdx: number }[] = [];
+    const matchDataList: any[] = [];
+
+    for (let i = 0; i < js.data.length; i++) {
+      const it = js.data[i];
       const mt = it.matchTime;
       if (!mt || typeof mt !== "number") continue;
       let status: string;
       if (now >= mt && now <= mt + 3 * 60 * 60 * 1000) status = "live";
       else if (now > mt + 3 * 60 * 60 * 1000) status = "finished";
       else status = "upcoming";
-      const servers: any[] = [];
+
+      matchDataList.push({ it, status, mt });
+
       if (status === "live" && it.anchors) {
         const anchorSlice = it.anchors.slice(0, 3);
-        for (const a of anchorSlice) {
+        for (let j = 0; j < anchorSlice.length; j++) {
+          const a = anchorSlice[j];
           const room = a.anchor?.roomNum;
           if (!room) continue;
-          const { m3u8, hdM3u8 } = await fetchServerURL(room);
-          if (m3u8) {
-            const sdToken = createStreamToken(m3u8);
-            servers.push({ name: "Soco SD", token: sdToken });
-          }
-          if (hdM3u8) {
-            const hdToken = createStreamToken(hdM3u8);
-            servers.push({ name: "Soco HD", token: hdToken });
-          }
+          roomFetchPromises.push({ matchIdx: matchDataList.length - 1, room, anchorIdx: j });
         }
       }
+    }
+
+    // Fetch all room URLs concurrently (big performance improvement!)
+    const roomResults = await Promise.allSettled(
+      roomFetchPromises.map((r) => fetchServerURL(r.room))
+    );
+
+    // Build a map: matchIdx -> servers[]
+    const serversMap = new Map<number, any[]>();
+    for (let k = 0; k < roomFetchPromises.length; k++) {
+      const { matchIdx } = roomFetchPromises[k];
+      const result = roomResults[k];
+      if (result.status !== "fulfilled") continue;
+      const { m3u8, hdM3u8 } = result.value;
+      if (!serversMap.has(matchIdx)) serversMap.set(matchIdx, []);
+      const servers = serversMap.get(matchIdx)!;
+      if (m3u8) {
+        const sdToken = createStreamToken(m3u8);
+        servers.push({ name: "Soco SD", token: sdToken });
+      }
+      if (hdM3u8) {
+        const hdToken = createStreamToken(hdM3u8);
+        servers.push({ name: "Soco HD", token: hdToken });
+      }
+    }
+
+    for (let i = 0; i < matchDataList.length; i++) {
+      const { it, status, mt } = matchDataList[i];
+      const servers = serversMap.get(i) || [];
 
       const homeLogo = sanitizeUrl(
         it.homeLogo || it.hostLogo || it.homeIcon || it.hostIcon
