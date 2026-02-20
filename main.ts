@@ -16,69 +16,11 @@ const DEV_PROFILE_IMG =
   "https://ui-avatars.com/api/?name=Dev&background=d97706&color=fff&size=128";
 const DEV_DISPLAY_NAME = Deno.env.get("DEV_DISPLAY_NAME") || "Developer";
 
-// ====== SECURITY: HMAC Secret for signed proxy URLs ======
-const PROXY_SECRET =
-  Deno.env.get("PROXY_SECRET") ||
-  crypto.getRandomValues(new Uint8Array(32)).reduce(
-    (s, b) => s + b.toString(16).padStart(2, "0"),
-    ""
-  );
-
-// ====== SECURITY: Opaque Token ↔ Real URL Mapping ======
-const TOKEN_EXPIRY_MS = 4 * 60 * 60 * 1000; // 4 hours
-const streamTokenMap = new Map<
-  string,
-  { url: string; expires: number }
->();
-
-function createStreamToken(originalUrl: string): string {
-  for (const [token, entry] of streamTokenMap) {
-    if (entry.url === originalUrl && Date.now() < entry.expires) {
-      return token;
-    }
-  }
-  const token = crypto.randomUUID();
-  streamTokenMap.set(token, {
-    url: originalUrl,
-    expires: Date.now() + TOKEN_EXPIRY_MS,
-  });
-  return token;
-}
-
-function resolveStreamToken(token: string): string | null {
-  if (!token || typeof token !== "string") return null;
-  if (
-    !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
-      token
-    )
-  )
-    return null;
-  const entry = streamTokenMap.get(token);
-  if (!entry) return null;
-  if (Date.now() > entry.expires) {
-    streamTokenMap.delete(token);
-    return null;
-  }
-  return entry.url;
-}
-
-setInterval(() => {
-  const now = Date.now();
-  for (const [token, entry] of streamTokenMap) {
-    if (now > entry.expires) streamTokenMap.delete(token);
-  }
-}, 5 * 60_000);
-
 // ====== SECURITY: Rate Limiter ======
 const rateLimitMap = new Map<string, { count: number; resetTime: number }>();
-const streamRateLimitMap = new Map<
-  string,
-  { count: number; resetTime: number }
->();
 const RATE_LIMIT_WINDOW = 60_000;
 const RATE_LIMIT_MAX = 60;
-const STREAM_RATE_LIMIT_MAX = 300; // Increased from 120 — HLS fetches many segments
-const BLOCK_THRESHOLD = 500; // Increased from 200
+const BLOCK_THRESHOLD = 200;
 const blockedIPs = new Map<string, number>();
 
 function getClientIP(req: Request): string {
@@ -90,111 +32,72 @@ function getClientIP(req: Request): string {
   );
 }
 
-function isRateLimited(
-  ip: string,
-  isStream: boolean = false
-): { limited: boolean; blocked: boolean } {
+function isRateLimited(ip: string): { limited: boolean; blocked: boolean } {
   const now = Date.now();
+
   const blockExpiry = blockedIPs.get(ip);
   if (blockExpiry && now < blockExpiry) {
     return { limited: true, blocked: true };
   } else if (blockExpiry) {
     blockedIPs.delete(ip);
   }
-  const map = isStream ? streamRateLimitMap : rateLimitMap;
-  const maxLimit = isStream ? STREAM_RATE_LIMIT_MAX : RATE_LIMIT_MAX;
-  const entry = map.get(ip);
+
+  const entry = rateLimitMap.get(ip);
   if (!entry || now > entry.resetTime) {
-    map.set(ip, { count: 1, resetTime: now + RATE_LIMIT_WINDOW });
+    rateLimitMap.set(ip, { count: 1, resetTime: now + RATE_LIMIT_WINDOW });
     return { limited: false, blocked: false };
   }
+
   entry.count++;
+
   if (entry.count > BLOCK_THRESHOLD) {
     blockedIPs.set(ip, now + 10 * 60_000);
     return { limited: true, blocked: true };
   }
-  if (entry.count > maxLimit) {
+
+  if (entry.count > RATE_LIMIT_MAX) {
     return { limited: true, blocked: false };
   }
+
   return { limited: false, blocked: false };
 }
 
+// Clean up stale entries periodically
 setInterval(() => {
   const now = Date.now();
   for (const [ip, entry] of rateLimitMap) {
     if (now > entry.resetTime) rateLimitMap.delete(ip);
-  }
-  for (const [ip, entry] of streamRateLimitMap) {
-    if (now > entry.resetTime) streamRateLimitMap.delete(ip);
   }
   for (const [ip, expiry] of blockedIPs) {
     if (now > expiry) blockedIPs.delete(ip);
   }
 }, 5 * 60_000);
 
-// ====== SECURITY: SSRF Protection ======
-function isPrivateUrl(urlStr: string): boolean {
-  try {
-    const parsed = new URL(urlStr);
-    const hostname = parsed.hostname.toLowerCase();
-    if (
-      hostname === "localhost" ||
-      hostname === "127.0.0.1" ||
-      hostname === "::1" ||
-      hostname === "[::1]" ||
-      hostname === "0.0.0.0"
-    )
-      return true;
-    const ipMatch = hostname.match(
-      /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/
-    );
-    if (ipMatch) {
-      const [, a, b] = ipMatch.map(Number);
-      if (a === 10) return true;
-      if (a === 172 && b >= 16 && b <= 31) return true;
-      if (a === 192 && b === 168) return true;
-      if (a === 169 && b === 254) return true;
-      if (a === 127) return true;
-      if (a === 0) return true;
-    }
-    if (
-      hostname.endsWith(".local") ||
-      hostname.endsWith(".internal") ||
-      hostname.endsWith(".corp") ||
-      hostname === "metadata.google.internal" ||
-      hostname === "metadata" ||
-      hostname.startsWith("169.254.")
-    )
-      return true;
-    if (hostname === "169.254.169.254") return true;
-    if (parsed.protocol !== "http:" && parsed.protocol !== "https:")
-      return true;
-    return false;
-  } catch {
-    return true;
-  }
-}
-
 // ====== SECURITY: Suspicious Request Detection ======
 function isSuspiciousRequest(req: Request): boolean {
   const ua = req.headers.get("user-agent") || "";
   const url = new URL(req.url);
+
   if (!ua || ua.length < 10) return true;
+
   const botPatterns = [
     /sqlmap/i, /nikto/i, /nmap/i, /masscan/i, /dirbuster/i,
     /gobuster/i, /wfuzz/i, /hydra/i, /burpsuite/i, /nessus/i,
     /openvas/i, /acunetix/i, /zgrab/i, /nuclei/i, /scrapy/i,
   ];
   if (botPatterns.some((p) => p.test(ua))) return true;
+
   const path = url.pathname;
   if (path.includes("..") || path.includes("//") || path.includes("\\"))
     return true;
+
   const maliciousPaths = [
     /\.env/i, /\.git/i, /wp-admin/i, /wp-login/i, /phpmyadmin/i,
     /\/admin\b/i, /\.php$/i, /\.asp$/i, /shell/i, /eval\(/i,
     /exec\(/i, /\.sql$/i, /backup/i, /\.bak$/i, /\.log$/i,
   ];
   if (maliciousPaths.some((p) => p.test(path))) return true;
+
   const query = url.search;
   const sqlPatterns = [
     /union.*select/i, /or\s+1\s*=\s*1/i, /drop\s+table/i,
@@ -202,6 +105,7 @@ function isSuspiciousRequest(req: Request): boolean {
     /javascript:/i, /onerror\s*=/i, /onload\s*=/i,
   ];
   if (sqlPatterns.some((p) => p.test(query))) return true;
+
   return false;
 }
 
@@ -218,35 +122,14 @@ function securityHeaders(): Record<string, string> {
       "script-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com https://cdn.jsdelivr.net; " +
       "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; " +
       "font-src https://fonts.gstatic.com; " +
-      "img-src 'self' data:; " +
-      "media-src 'self' blob:; " +
-      "connect-src 'self';",
+      "img-src 'self' https: data:; " +
+      "media-src 'self' blob: https:; " +
+      "connect-src 'self' https:;",
     "Strict-Transport-Security": "max-age=31536000; includeSubDomains",
   };
 }
 
-// ====== SECURITY: Allowed content types for proxy ======
-const ALLOWED_PROXY_CONTENT_TYPES = [
-  "application/vnd.apple.mpegurl",
-  "application/x-mpegurl",
-  "video/mp2t",
-  "video/mp4",
-  "video/mpeg",
-  "video/x-flv",
-  "audio/aac",
-  "audio/mpeg",
-  "application/octet-stream",
-  "binary/octet-stream",
-  "text/plain",
-];
-
-function isAllowedContentType(contentType: string): boolean {
-  if (!contentType) return true;
-  const lower = contentType.toLowerCase().split(";")[0].trim();
-  return ALLOWED_PROXY_CONTENT_TYPES.some((t) => lower.includes(t));
-}
-
-// ====== SECURITY: Sanitize URL ======
+// ====== SECURITY: Sanitize URL (only allow http/https) ======
 function sanitizeUrl(url: string | null | undefined): string | null {
   if (!url || typeof url !== "string") return null;
   const trimmed = url.trim();
@@ -269,270 +152,11 @@ function sanitizeText(
     .slice(0, maxLen);
 }
 
-// ====== SECURITY: Validate referer for proxy requests ======
-function isValidProxyReferer(req: Request): boolean {
-  const referer = req.headers.get("referer");
-  const origin = req.headers.get("origin");
-  const host = req.headers.get("host");
-  if (!host) return false;
-  if (referer) {
-    try {
-      const refUrl = new URL(referer);
-      if (refUrl.host === host) return true;
-    } catch { /* ignore */ }
-  }
-  if (origin) {
-    try {
-      const origUrl = new URL(origin);
-      if (origUrl.host === host) return true;
-    } catch { /* ignore */ }
-  }
-  // Allow requests with no referer/origin (HLS player internal requests)
-  if (!referer && !origin) return true;
-  return false;
-}
-
-// ====== Stream Proxy Route (Token-Based) ======
-const MAX_PROXY_BODY_SIZE = 50 * 1024 * 1024;
-
-async function handleStreamProxy(
-  req: Request,
-  url: URL
-): Promise<Response> {
-  if (!isValidProxyReferer(req)) {
-    return new Response("Forbidden", {
-      status: 403,
-      headers: securityHeaders(),
-    });
-  }
-  const token = url.searchParams.get("token");
-  if (!token) {
-    return new Response("Missing token", {
-      status: 400,
-      headers: securityHeaders(),
-    });
-  }
-  const streamUrl = resolveStreamToken(token);
-  if (!streamUrl) {
-    return new Response("Invalid or expired token", {
-      status: 403,
-      headers: securityHeaders(),
-    });
-  }
-  if (isPrivateUrl(streamUrl)) {
-    return new Response("Forbidden", {
-      status: 403,
-      headers: securityHeaders(),
-    });
-  }
-  try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 25000); // Increased from 15s to 25s
-    const proxyRes = await fetch(streamUrl, {
-      headers: {
-        "User-Agent": API_USER_AGENT,
-        Referer: API_REFERER,
-      },
-      signal: controller.signal,
-    });
-    clearTimeout(timeout);
-    if (!proxyRes.ok) {
-      return new Response("Stream unavailable", {
-        status: 502,
-        headers: securityHeaders(),
-      });
-    }
-    const contentType = proxyRes.headers.get("content-type") || "";
-    if (
-      contentType &&
-      !streamUrl.endsWith(".ts") &&
-      !streamUrl.endsWith(".m3u8") &&
-      !streamUrl.endsWith(".m4s") &&
-      !streamUrl.endsWith(".aac") &&
-      !streamUrl.endsWith(".key") &&
-      !isAllowedContentType(contentType)
-    ) {
-      return new Response("Unsupported content type", {
-        status: 403,
-        headers: securityHeaders(),
-      });
-    }
-    if (
-      streamUrl.endsWith(".m3u8") ||
-      contentType.includes("mpegurl") ||
-      contentType.includes("m3u8")
-    ) {
-      const text = await proxyRes.text();
-      const trimmedText = text.trim();
-      if (
-        trimmedText.length > 0 &&
-        !trimmedText.startsWith("#EXTM3U") &&
-        !trimmedText.startsWith("#EXT")
-      ) {
-        return new Response("Invalid m3u8 content", {
-          status: 502,
-          headers: securityHeaders(),
-        });
-      }
-      const baseUrl =
-        streamUrl.substring(0, streamUrl.lastIndexOf("/") + 1);
-      const rewritten = text
-        .split("\n")
-        .map((line: string) => {
-          const trimmed = line.trim();
-          if (trimmed && !trimmed.startsWith("#")) {
-            let absoluteUrl: string;
-            if (/^https?:\/\//i.test(trimmed)) {
-              absoluteUrl = trimmed;
-            } else {
-              absoluteUrl = baseUrl + trimmed;
-            }
-            if (isPrivateUrl(absoluteUrl)) {
-              return "# blocked-private-url";
-            }
-            const segToken = createStreamToken(absoluteUrl);
-            return "/api/stream-proxy?token=" + segToken;
-          }
-          if (trimmed.startsWith("#") && trimmed.includes('URI="')) {
-            return line.replace(
-              /URI="([^"]+)"/g,
-              (_match: string, uri: string) => {
-                let absoluteUri: string;
-                if (/^https?:\/\//i.test(uri)) {
-                  absoluteUri = uri;
-                } else {
-                  absoluteUri = baseUrl + uri;
-                }
-                if (isPrivateUrl(absoluteUri)) {
-                  return 'URI=""';
-                }
-                const keyToken = createStreamToken(absoluteUri);
-                return (
-                  'URI="/api/stream-proxy?token=' + keyToken + '"'
-                );
-              }
-            );
-          }
-          return line;
-        })
-        .join("\n");
-      return new Response(rewritten, {
-        status: 200,
-        headers: {
-          "Content-Type": "application/vnd.apple.mpegurl",
-          "Access-Control-Allow-Origin": "*",
-          "Cache-Control": "no-cache, no-store", // Never cache live m3u8
-          ...securityHeaders(),
-        },
-      });
-    }
-    const contentLength = proxyRes.headers.get("content-length");
-    if (contentLength && parseInt(contentLength) > MAX_PROXY_BODY_SIZE) {
-      return new Response("Response too large", {
-        status: 502,
-        headers: securityHeaders(),
-      });
-    }
-    const resHeaders: Record<string, string> = {
-      "Access-Control-Allow-Origin": "*",
-      "Cache-Control": "public, max-age=60", // Segments can be cached longer
-      ...securityHeaders(),
-    };
-    if (contentType) {
-      resHeaders["Content-Type"] = contentType;
-    } else if (streamUrl.endsWith(".ts")) {
-      resHeaders["Content-Type"] = "video/mp2t";
-    } else if (streamUrl.endsWith(".m4s")) {
-      resHeaders["Content-Type"] = "video/iso.segment";
-    } else if (streamUrl.endsWith(".aac")) {
-      resHeaders["Content-Type"] = "audio/aac";
-    }
-    return new Response(proxyRes.body, {
-      status: 200,
-      headers: resHeaders,
-    });
-  } catch (e: any) {
-    console.warn("Stream proxy error:", e.message);
-    return new Response("Stream error", {
-      status: 502,
-      headers: securityHeaders(),
-    });
-  }
-}
-
-// ====== Image Proxy Route (Token-Based) ======
-async function handleImageProxy(
-  req: Request,
-  url: URL
-): Promise<Response> {
-  if (!isValidProxyReferer(req)) {
-    return new Response("Forbidden", { status: 403, headers: securityHeaders() });
-  }
-
-  const token = url.searchParams.get("token");
-  if (!token) {
-    return new Response("Missing token", { status: 400, headers: securityHeaders() });
-  }
-
-  const imgUrl = resolveStreamToken(token);
-  if (!imgUrl) {
-    return new Response("Invalid or expired token", { status: 403, headers: securityHeaders() });
-  }
-
-  if (isPrivateUrl(imgUrl)) {
-    return new Response("Forbidden", { status: 403, headers: securityHeaders() });
-  }
-
-  try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 10000);
-
-    const proxyRes = await fetch(imgUrl, {
-      headers: {
-        "User-Agent": API_USER_AGENT,
-        Referer: API_REFERER,
-      },
-      signal: controller.signal,
-    });
-    clearTimeout(timeout);
-
-    if (!proxyRes.ok) {
-      return new Response("Image unavailable", { status: 502, headers: securityHeaders() });
-    }
-
-    const contentType = proxyRes.headers.get("content-type") || "";
-    if (contentType && !contentType.startsWith("image/")) {
-      return new Response("Not an image", { status: 403, headers: securityHeaders() });
-    }
-
-    const contentLength = proxyRes.headers.get("content-length");
-    if (contentLength && parseInt(contentLength) > 5 * 1024 * 1024) {
-      return new Response("Image too large", { status: 502, headers: securityHeaders() });
-    }
-
-    return new Response(proxyRes.body, {
-      status: 200,
-      headers: {
-        "Content-Type": contentType || "image/png",
-        "Cache-Control": "public, max-age=86400",
-        "Access-Control-Allow-Origin": "*",
-        ...securityHeaders(),
-      },
-    });
-  } catch (e: any) {
-    console.warn("Image proxy error:", e.message);
-    return new Response("Image error", { status: 502, headers: securityHeaders() });
-  }
-}
-
 serve(async (req) => {
   const url = new URL(req.url);
   const clientIP = getClientIP(req);
 
-  const isStreamReq = url.pathname === "/api/stream-proxy";
-  const isImgReq = url.pathname === "/api/img-proxy";
-
-  const { limited, blocked } = isRateLimited(clientIP, isStreamReq || isImgReq);
+  const { limited, blocked } = isRateLimited(clientIP);
   if (blocked) {
     return new Response(
       JSON.stringify({ error: "Blocked: Too many requests. Try again later." }),
@@ -574,7 +198,7 @@ serve(async (req) => {
     });
   }
 
-  // --- API ROUTE: Matches ---
+  // --- 1. API ROUTE: Matches ---
   if (url.pathname === "/api/matches") {
     try {
       const getVNDate = (offset: number) => {
@@ -589,13 +213,15 @@ serve(async (req) => {
           .format(d)
           .replace(/-/g, "");
       };
+
       const dates = [getVNDate(-1), getVNDate(0), getVNDate(1)];
-      // Fetch all dates concurrently
-      const allResults = await Promise.all(dates.map((d) => fetchMatches(d)));
+
       let allMatches: any[] = [];
-      for (const matches of allResults) {
+      for (const d of dates) {
+        const matches = await fetchMatches(d);
         allMatches = allMatches.concat(matches);
       }
+
       allMatches.sort((a, b) => {
         if (a.match_status === "live" && b.match_status !== "live") return -1;
         if (a.match_status !== "live" && b.match_status === "live") return 1;
@@ -605,6 +231,7 @@ serve(async (req) => {
           return 1;
         return 0;
       });
+
       return new Response(JSON.stringify(allMatches), {
         headers: {
           "Content-Type": "application/json",
@@ -626,17 +253,7 @@ serve(async (req) => {
     }
   }
 
-  // --- API ROUTE: Stream Proxy ---
-  if (url.pathname === "/api/stream-proxy") {
-    return await handleStreamProxy(req, url);
-  }
-
-  // --- API ROUTE: Image Proxy ---
-  if (url.pathname === "/api/img-proxy") {
-    return await handleImageProxy(req, url);
-  }
-
-  // --- FRONTEND UI ---
+  // --- 2. FRONTEND UI (HTML) ---
   if (url.pathname === "/") {
     return new Response(getHTML(), {
       headers: {
@@ -777,53 +394,6 @@ function getHTML(): string {
       box-shadow: 0 0 30px rgba(239,68,68,0.08);
     }
 
-    .card-now-playing {
-      border-color: rgba(217,119,6,0.5) !important;
-      box-shadow: 0 0 0 2px rgba(217,119,6,0.15), 0 8px 32px rgba(217,119,6,0.12) !important;
-      background: rgba(255,251,235,0.9) !important;
-    }
-    .card-now-playing .now-playing-badge {
-      display: inline-flex !important;
-    }
-    .now-playing-badge {
-      display: none !important;
-      align-items: center;
-      gap: 5px;
-      background: linear-gradient(135deg, #d97706, #b45309);
-      color: #fff;
-      font-size: 9px;
-      font-weight: 800;
-      padding: 3px 10px;
-      border-radius: 20px;
-      letter-spacing: 0.5px;
-      text-transform: uppercase;
-      animation: pulse-badge 2s ease-in-out infinite;
-    }
-    @keyframes pulse-badge {
-      0%, 100% { box-shadow: 0 0 8px rgba(217,119,6,0.4); }
-      50% { box-shadow: 0 0 16px rgba(217,119,6,0.7); }
-    }
-    .now-playing-icon {
-      display: flex;
-      align-items: flex-end;
-      gap: 1.5px;
-      height: 10px;
-    }
-    .now-playing-icon span {
-      display: block;
-      width: 2.5px;
-      background: #fff;
-      border-radius: 1px;
-      animation: eq-bar 0.8s ease-in-out infinite;
-    }
-    .now-playing-icon span:nth-child(1) { height: 4px; animation-delay: 0s; }
-    .now-playing-icon span:nth-child(2) { height: 8px; animation-delay: 0.15s; }
-    .now-playing-icon span:nth-child(3) { height: 5px; animation-delay: 0.3s; }
-    @keyframes eq-bar {
-      0%, 100% { transform: scaleY(1); }
-      50% { transform: scaleY(0.4); }
-    }
-
     .team-logo {
       width: 48px; height: 48px;
       border-radius: 50%;
@@ -957,25 +527,6 @@ function getHTML(): string {
       border: 2px solid rgba(217,119,6,0.2);
       box-shadow: 0 20px 60px rgba(0,0,0,0.15);
     }
-
-    .player-now-info {
-      background: linear-gradient(135deg, #1e293b, #0f172a);
-      padding: 8px 16px;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      gap: 8px;
-      font-size: 12px;
-      font-weight: 600;
-      color: #facc15;
-      border-top: 1px solid rgba(255,255,255,0.06);
-    }
-    .player-now-info .player-now-league {
-      color: #94a3b8;
-      font-size: 10px;
-      font-weight: 500;
-    }
-
     .close-btn {
       background: linear-gradient(135deg, #1e293b, #0f172a);
       border-top: 1px solid rgba(255,255,255,0.06);
@@ -1123,6 +674,7 @@ function getHTML(): string {
 <body>
   <div class="app-container">
 
+    <!-- Premium Header -->
     <div class="premium-header">
       <div class="max-w-md mx-auto px-5 py-4">
         <div class="flex items-center justify-between">
@@ -1140,6 +692,7 @@ function getHTML(): string {
 
     <div class="max-w-md mx-auto px-4 pt-5 pb-4">
 
+      <!-- Filter Tabs -->
       <div class="flex gap-2 mb-4 overflow-x-auto pb-1 fade-up fade-up-delay-1" id="tabs">
         <button class="tab-btn active" data-filter="all">All Matches</button>
         <button class="tab-btn" data-filter="live">Live</button>
@@ -1147,6 +700,7 @@ function getHTML(): string {
         <button class="tab-btn" data-filter="finished">Finished</button>
       </div>
 
+      <!-- Stats Bar -->
       <div class="flex gap-2 justify-center mb-5 fade-up fade-up-delay-2" id="stats-bar">
         <span class="stat-pill text-slate-500">
           <span class="stat-indicator" style="background:#64748b;"></span>
@@ -1162,6 +716,7 @@ function getHTML(): string {
         </span>
       </div>
 
+      <!-- Video Player -->
       <div id="player-container" class="hidden sticky top-[68px] z-50 mb-5 player-wrapper">
         <div class="bg-black relative" id="player-inner">
           <video id="video" controls class="w-full aspect-video" autoplay playsinline></video>
@@ -1169,20 +724,18 @@ function getHTML(): string {
             <div class="loading-spinner"></div>
           </div>
         </div>
-        <div id="player-now-info" class="player-now-info hidden">
-          <span id="player-now-teams">—</span>
-          <span class="player-now-league" id="player-now-league"></span>
-        </div>
         <button id="close-player-btn" class="close-btn w-full text-xs font-bold py-3.5 flex items-center justify-center gap-2">
           ✕ Close Player
         </button>
       </div>
 
+      <!-- Loading -->
       <div id="loading" class="flex flex-col items-center py-20 fade-up fade-up-delay-3">
         <div class="loading-spinner mb-4"></div>
         <span class="text-slate-400 text-sm font-medium">Loading matches...</span>
       </div>
 
+      <!-- Match List -->
       <div id="match-list" class="space-y-3"></div>
 
       <div class="bottom-safe"></div>
@@ -1194,17 +747,7 @@ function getHTML(): string {
     var allData = [];
     var currentFilter = "all";
     var currentHls = null;
-    var currentStreamToken = null;
-    var currentMatchId = null; // CHANGED: use unique match ID instead of index
-    var playIdCounter = 0;
-    var isPlayerActive = false; // NEW: track if player is actively playing
-    var hlsRecoveryCount = 0; // NEW: track recovery attempts
-    var MAX_RECOVERY = 5; // NEW: max auto-recovery attempts
-
-    // NEW: Generate a unique ID for each match to track across data refreshes
-    function getMatchId(m) {
-      return (m.home_team_name || "") + "|" + (m.away_team_name || "") + "|" + (m.league_name || "") + "|" + (m.match_time || "");
-    }
+    var currentStreamUrl = null;
 
     function escapeHtml(str) {
       if (typeof str !== "string") return "";
@@ -1239,14 +782,10 @@ function getHTML(): string {
         updateStats();
         renderMatches();
       } catch (e) {
-        // Only show error if we have no data at all
-        if (allData.length === 0) {
-          document.getElementById("loading").innerHTML =
-            '<div class="empty-state"><div class="empty-state-icon">⚠️</div>' +
-            '<div class="text-red-500 text-sm font-medium">' + escapeHtml(e.message) + '</div>' +
-            '<div class="text-slate-400 text-xs mt-2">Pull to refresh or try again later</div></div>';
-        }
-        // If we already have data, silently ignore the error — keep showing existing matches
+        document.getElementById("loading").innerHTML =
+          '<div class="empty-state"><div class="empty-state-icon">⚠️</div>' +
+          '<div class="text-red-500 text-sm font-medium">' + escapeHtml(e.message) + '</div>' +
+          '<div class="text-slate-400 text-xs mt-2">Pull to refresh or try again later</div></div>';
       }
     }
 
@@ -1286,30 +825,6 @@ function getHTML(): string {
       return "day-other";
     }
 
-    function updatePlayerInfo() {
-      var infoEl = document.getElementById("player-now-info");
-      var teamsEl = document.getElementById("player-now-teams");
-      var leagueEl = document.getElementById("player-now-league");
-      if (currentMatchId && allData.length > 0) {
-        var m = null;
-        for (var i = 0; i < allData.length; i++) {
-          if (getMatchId(allData[i]) === currentMatchId) {
-            m = allData[i];
-            break;
-          }
-        }
-        if (m) {
-          teamsEl.textContent = (m.home_team_name || "Home") + "  vs  " + (m.away_team_name || "Away");
-          leagueEl.textContent = m.league_name || "";
-          infoEl.classList.remove("hidden");
-        } else {
-          infoEl.classList.add("hidden");
-        }
-      } else {
-        infoEl.classList.add("hidden");
-      }
-    }
-
     function renderMatches() {
       var list = document.getElementById("match-list");
       var filtered = allData;
@@ -1331,9 +846,7 @@ function getHTML(): string {
         var isLive = m.match_status === "live";
         var isFinished = m.match_status === "finished";
 
-        var matchId = getMatchId(m);
-        var isNowPlaying = (matchId === currentMatchId && isPlayerActive);
-
+        // Day separator
         var matchDay = m.match_day || "Today";
         if (matchDay !== lastDay) {
           lastDay = matchDay;
@@ -1347,26 +860,14 @@ function getHTML(): string {
 
         var card = document.createElement("div");
         card.className = isLive ? "card card-live p-5" : "card p-5";
-        if (isNowPlaying) {
-          card.className += " card-now-playing";
-        }
         card.style.animation = "fadeUp 0.4s ease-out " + (idx * 0.05) + "s both";
 
         var headerRow = document.createElement("div");
         headerRow.className = "flex justify-between items-center mb-4";
 
-        var headerLeft = document.createElement("div");
-        headerLeft.className = "flex items-center gap-2 min-w-0 flex-1";
-
         var leagueBadge = document.createElement("span");
-        leagueBadge.className = "league-badge text-[10px] text-amber-700 truncate";
+        leagueBadge.className = "league-badge text-[10px] text-amber-700 truncate max-w-[60%]";
         leagueBadge.textContent = m.league_name || "Unknown";
-        headerLeft.appendChild(leagueBadge);
-
-        var nowBadge = document.createElement("span");
-        nowBadge.className = "now-playing-badge";
-        nowBadge.innerHTML = '<span class="now-playing-icon"><span></span><span></span><span></span></span> NOW';
-        headerLeft.appendChild(nowBadge);
 
         var statusBadge = document.createElement("span");
         if (isLive) {
@@ -1382,7 +883,7 @@ function getHTML(): string {
           statusBadge.textContent = dayLabel + (m.match_time || "");
         }
 
-        headerRow.appendChild(headerLeft);
+        headerRow.appendChild(leagueBadge);
         headerRow.appendChild(statusBadge);
 
         var teamsRow = document.createElement("div");
@@ -1435,10 +936,9 @@ function getHTML(): string {
             var isHD = s.name && s.name.indexOf("HD") !== -1;
             btn.className = (isHD ? "btn-hd" : "btn-sd") + " text-white text-[11px] px-5 py-2 rounded-full font-bold transition-all";
             btn.textContent = isHD ? "▶ HD" : "▶ SD";
-            btn.setAttribute("data-stream-token", s.token);
-            btn.setAttribute("data-match-id", matchId);
+            btn.setAttribute("data-stream-url", s.stream_url);
             btn.addEventListener("click", function() {
-              play(this.getAttribute("data-stream-token"), this.getAttribute("data-match-id"));
+              play(this.getAttribute("data-stream-url"));
             });
             btnsRow.appendChild(btn);
           });
@@ -1477,21 +977,23 @@ function getHTML(): string {
     function showPlayerError(message) {
       var existing = document.getElementById("player-error-overlay");
       if (existing) existing.remove();
+
       var overlay = document.createElement("div");
       overlay.id = "player-error-overlay";
       overlay.className = "player-error";
       overlay.innerHTML = '<div>' + escapeHtml(message) + '</div>';
-      if (currentStreamToken) {
+
+      if (currentStreamUrl) {
         var retryBtn = document.createElement("button");
         retryBtn.className = "player-error-btn";
         retryBtn.textContent = "Retry";
         retryBtn.addEventListener("click", function() {
           overlay.remove();
-          hlsRecoveryCount = 0; // reset recovery count on manual retry
-          play(currentStreamToken, currentMatchId);
+          play(currentStreamUrl);
         });
         overlay.appendChild(retryBtn);
       }
+
       document.getElementById("player-inner").appendChild(overlay);
     }
 
@@ -1500,268 +1002,104 @@ function getHTML(): string {
       if (existing) existing.remove();
     }
 
-    function destroyCurrentPlayer() {
-      var vid = document.getElementById("video");
-      if (currentHls) {
-        try { currentHls.destroy(); } catch(e) {}
-        currentHls = null;
-      }
-      vid.pause();
-      vid.removeAttribute("src");
-      vid.load();
-      clearPlayerError();
-      showPlayerLoading(false);
-    }
+    function play(streamUrl) {
+      if (!streamUrl || typeof streamUrl !== "string") return;
+      if (!/^https?:\\/\\//i.test(streamUrl)) return;
 
-    function play(streamToken, matchId) {
-      if (!streamToken || typeof streamToken !== "string") return;
-
-      playIdCounter++;
-      var thisPlayId = playIdCounter;
-      hlsRecoveryCount = 0;
-
-      destroyCurrentPlayer();
-
-      currentStreamToken = streamToken;
-      currentMatchId = matchId || null;
-      isPlayerActive = true;
+      currentStreamUrl = streamUrl;
 
       document.getElementById("player-container").classList.remove("hidden");
       clearPlayerError();
       showPlayerLoading(true);
-      updatePlayerInfo();
-      renderMatches();
 
       var vid = document.getElementById("video");
-      var proxyUrl = "/api/stream-proxy?token=" + encodeURIComponent(streamToken);
 
-      setTimeout(function() {
-        if (thisPlayId !== playIdCounter) return;
+      if (currentHls) {
+        currentHls.destroy();
+        currentHls = null;
+      }
 
-        if (typeof Hls !== "undefined" && Hls.isSupported()) {
-          var hls = new Hls({
-            enableWorker: true,
-            lowLatencyMode: false, // CHANGED: disable low latency for stability
-            maxBufferLength: 30,
-            maxMaxBufferLength: 120, // INCREASED from 60
-            maxBufferHole: 1.0, // NEW: allow up to 1s gaps
-            highBufferWatchdogPeriod: 3, // NEW: check buffer health every 3s
-            manifestLoadingTimeOut: 20000, // INCREASED from 15s
-            manifestLoadingMaxRetry: 6, // INCREASED from 3
-            manifestLoadingRetryDelay: 1500, // INCREASED from 1s
-            levelLoadingTimeOut: 20000, // INCREASED from 15s
-            levelLoadingMaxRetry: 6, // INCREASED from 3
-            levelLoadingRetryDelay: 1500,
-            fragLoadingTimeOut: 30000, // INCREASED from 20s
-            fragLoadingMaxRetry: 8, // INCREASED from 5
-            fragLoadingRetryDelay: 1500, // INCREASED from 1s
-            startFragPrefetch: true, // NEW: prefetch next fragment
-            testBandwidth: true,
-            progressive: true,
-            backBufferLength: 30 // NEW: keep 30s back buffer
-          });
-          currentHls = hls;
+      vid.removeAttribute("src");
+      vid.load();
 
-          hls.loadSource(proxyUrl);
-          hls.attachMedia(vid);
+      if (typeof Hls !== "undefined" && Hls.isSupported()) {
+        var hls = new Hls({
+          enableWorker: true,
+          lowLatencyMode: true,
+          maxBufferLength: 30,
+          maxMaxBufferLength: 60,
+        });
+        currentHls = hls;
+        hls.loadSource(streamUrl);
+        hls.attachMedia(vid);
 
-          var manifestLoaded = false;
-
-          hls.on(Hls.Events.MANIFEST_PARSED, function() {
-            if (thisPlayId !== playIdCounter) return;
-            manifestLoaded = true;
-            showPlayerLoading(false);
-            vid.play().catch(function() {});
-          });
-
-          hls.on(Hls.Events.FRAG_LOADED, function() {
-            if (thisPlayId !== playIdCounter) return;
-            showPlayerLoading(false);
-          });
-
-          // NEW: Handle buffer stalls — auto-recover
-          hls.on(Hls.Events.BUFFER_STALLED_ERROR, function() {
-            if (thisPlayId !== playIdCounter) return;
-            console.warn("HLS buffer stalled, attempting recovery...");
-            // Don't show loading spinner for brief stalls
-          });
-
-          // NEW: Handle when fragments are changed/parsed
-          hls.on(Hls.Events.FRAG_CHANGED, function() {
-            if (thisPlayId !== playIdCounter) return;
-            // Stream is healthy — hide any loading
-            showPlayerLoading(false);
-            clearPlayerError();
-          });
-
-          hls.on(Hls.Events.ERROR, function(event, data) {
-            if (thisPlayId !== playIdCounter) return;
-
-            console.warn("HLS error:", data.type, data.details, "fatal:", data.fatal);
-
-            if (data.fatal) {
-              if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
-                hlsRecoveryCount++;
-                if (hlsRecoveryCount <= MAX_RECOVERY) {
-                  console.warn("HLS network error, recovery attempt " + hlsRecoveryCount + "/" + MAX_RECOVERY);
-                  // Show loading during recovery but not error
-                  showPlayerLoading(true);
-                  // Wait a bit then retry
-                  setTimeout(function() {
-                    if (thisPlayId !== playIdCounter) return;
-                    try {
-                      hls.startLoad();
-                    } catch(e) {}
-                  }, 2000 * hlsRecoveryCount); // Exponential backoff
-                } else {
-                  showPlayerLoading(false);
-                  showPlayerError("Stream connection lost. Please try again.");
-                }
-              } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
-                hlsRecoveryCount++;
-                if (hlsRecoveryCount <= MAX_RECOVERY) {
-                  console.warn("HLS media error, recovery attempt " + hlsRecoveryCount + "/" + MAX_RECOVERY);
-                  showPlayerLoading(true);
-                  try {
-                    hls.recoverMediaError();
-                  } catch(e) {}
-                  setTimeout(function() {
-                    if (thisPlayId !== playIdCounter) return;
-                    showPlayerLoading(false);
-                    vid.play().catch(function() {});
-                  }, 2000);
-                } else {
-                  showPlayerLoading(false);
-                  showPlayerError("Media error. Please try another server.");
-                }
-              } else {
-                showPlayerLoading(false);
-                showPlayerError("Stream unavailable. Please try another server.");
-                try { hls.destroy(); } catch(e) {}
-                if (thisPlayId === playIdCounter) {
-                  currentHls = null;
-                }
-              }
-            } else {
-              // Non-fatal errors — just log, HLS.js handles internally
-              // But if we see too many non-fatal errors in a row, the fatal ones above will catch it
-            }
-          });
-
-          // NEW: Timeout fallback — if nothing loads after 20s, show error
-          setTimeout(function() {
-            if (thisPlayId !== playIdCounter) return;
-            if (!manifestLoaded) {
-              showPlayerLoading(false);
-              showPlayerError("Stream took too long to load. Please try another server.");
-            }
-          }, 20000);
-
-        } else if (vid.canPlayType("application/vnd.apple.mpegurl")) {
-          // Safari / native HLS
-          vid.src = proxyUrl;
-
-          var nativeLoaded = false;
-
-          vid.addEventListener("loadeddata", function onLoaded() {
-            if (thisPlayId !== playIdCounter) return;
-            nativeLoaded = true;
-            showPlayerLoading(false);
-            vid.removeEventListener("loadeddata", onLoaded);
-          });
-
-          vid.addEventListener("canplay", function onCanPlay() {
-            if (thisPlayId !== playIdCounter) return;
-            nativeLoaded = true;
-            showPlayerLoading(false);
-            vid.removeEventListener("canplay", onCanPlay);
-          });
-
-          vid.addEventListener("error", function onError() {
-            if (thisPlayId !== playIdCounter) return;
-            showPlayerLoading(false);
-            showPlayerError("Stream unavailable. Please try another server.");
-            vid.removeEventListener("error", onError);
-          });
-
-          // NEW: Handle stalls on native player
-          vid.addEventListener("waiting", function onWaiting() {
-            if (thisPlayId !== playIdCounter) {
-              vid.removeEventListener("waiting", onWaiting);
-              return;
-            }
-            // Only show loading if stalled for more than 3s
-            var stallTimer = setTimeout(function() {
-              if (thisPlayId !== playIdCounter) return;
-              if (vid.readyState < 3) {
-                showPlayerLoading(true);
-              }
-            }, 3000);
-            vid.addEventListener("playing", function onPlaying() {
-              clearTimeout(stallTimer);
-              showPlayerLoading(false);
-              vid.removeEventListener("playing", onPlaying);
-            }, { once: true });
-          });
-
-          vid.play().catch(function() {});
-
-          setTimeout(function() {
-            if (thisPlayId !== playIdCounter) return;
-            if (!nativeLoaded) {
-              showPlayerLoading(false);
-              showPlayerError("Stream took too long to load. Please try another server.");
-            }
-          }, 20000);
-
-        } else {
+        hls.on(Hls.Events.MANIFEST_PARSED, function() {
           showPlayerLoading(false);
-          showPlayerError("Your browser does not support HLS streaming.");
-        }
-      }, 150);
+          vid.play().catch(function() {});
+        });
+
+        hls.on(Hls.Events.FRAG_LOADED, function() {
+          showPlayerLoading(false);
+        });
+
+        hls.on(Hls.Events.ERROR, function(event, data) {
+          if (data.fatal) {
+            showPlayerLoading(false);
+            if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+              console.warn("HLS network error, attempting recovery...");
+              hls.startLoad();
+              setTimeout(function() {
+                if (vid.paused && vid.readyState < 3) {
+                  showPlayerError("Stream connection failed. Please try another server.");
+                }
+              }, 10000);
+            } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+              console.warn("HLS media error, attempting recovery...");
+              hls.recoverMediaError();
+            } else {
+              showPlayerError("Stream unavailable. Please try another server.");
+              hls.destroy();
+              currentHls = null;
+            }
+          }
+        });
+      } else if (vid.canPlayType("application/vnd.apple.mpegurl")) {
+        vid.src = streamUrl;
+        vid.addEventListener("loadeddata", function onLoaded() {
+          showPlayerLoading(false);
+          vid.removeEventListener("loadeddata", onLoaded);
+        });
+        vid.addEventListener("error", function onError() {
+          showPlayerLoading(false);
+          showPlayerError("Stream unavailable. Please try another server.");
+          vid.removeEventListener("error", onError);
+        });
+        vid.play().catch(function() {});
+      } else {
+        showPlayerLoading(false);
+        showPlayerError("Your browser does not support HLS streaming.");
+      }
 
       window.scrollTo({ top: 0, behavior: "smooth" });
     }
 
     function closePlayer() {
-      destroyCurrentPlayer();
-      currentStreamToken = null;
-      currentMatchId = null;
-      isPlayerActive = false;
-      hlsRecoveryCount = 0;
+      var vid = document.getElementById("video");
+      vid.pause();
+      vid.removeAttribute("src");
+      vid.load();
+      if (currentHls) {
+        currentHls.destroy();
+        currentHls = null;
+      }
+      currentStreamUrl = null;
+      clearPlayerError();
+      showPlayerLoading(false);
       document.getElementById("player-container").classList.add("hidden");
-      document.getElementById("player-now-info").classList.add("hidden");
-      renderMatches();
     }
 
-    // NEW: Handle video element stall events for HLS.js too
-    (function() {
-      var vid = document.getElementById("video");
-
-      // When video stalls (buffering), show loading after a delay
-      vid.addEventListener("waiting", function() {
-        if (!isPlayerActive) return;
-        showPlayerLoading(true);
-      });
-
-      // When video resumes playing, hide loading
-      vid.addEventListener("playing", function() {
-        if (!isPlayerActive) return;
-        showPlayerLoading(false);
-        clearPlayerError();
-      });
-
-      // When video can play through, hide loading
-      vid.addEventListener("canplaythrough", function() {
-        if (!isPlayerActive) return;
-        showPlayerLoading(false);
-      });
-    })();
-
     load();
-    setInterval(function() {
-      load();
-    }, 60000);
+    setInterval(load, 60000);
   <\/script>
 </body>
 </html>`;
@@ -1772,15 +1110,17 @@ function getHTML(): string {
 async function fetchServerURL(roomNum: any) {
   try {
     const roomStr = String(roomNum);
-    if (!/^[a-zA-Z0-9_-]+$/.test(roomStr))
-      return { m3u8: null, hdM3u8: null };
+    if (!/^[a-zA-Z0-9_-]+$/.test(roomStr)) return { m3u8: null, hdM3u8: null };
+
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 10000); // Increased from 8s
+    const timeout = setTimeout(() => controller.abort(), 8000);
+
     const res = await fetch(`${ROOM_API_BASE}/room/${roomStr}/detail.json`, {
       headers: { "User-Agent": API_USER_AGENT, Referer: API_REFERER },
       signal: controller.signal,
     });
     clearTimeout(timeout);
+
     const txt = await res.text();
     const m = txt.match(/detail\((.*)\)/);
     if (m) {
@@ -1791,81 +1131,56 @@ async function fetchServerURL(roomNum: any) {
         return { m3u8, hdM3u8 };
       }
     }
-  } catch (_e) { /* ignore */ }
+  } catch (_e) {
+    /* ignore */
+  }
   return { m3u8: null, hdM3u8: null };
 }
 
 async function fetchMatches(date: string) {
   if (!/^\d{8}$/.test(date)) return [];
+
   try {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 15000); // Increased from 10s
+    const timeout = setTimeout(() => controller.abort(), 10000);
+
     const res = await fetch(`${MATCH_API_BASE}/match/matches_${date}.json`, {
       headers: { "User-Agent": API_USER_AGENT, Referer: API_REFERER },
       signal: controller.signal,
     });
     clearTimeout(timeout);
+
     const txt = await res.text();
     const m = txt.match(/matches_\d+\((.*)\)/);
     if (!m) return [];
+
     const js = JSON.parse(m[1]);
     if (js.code !== 200) return [];
+
     const now = Date.now();
     const results = [];
 
-    // Collect all rooms to fetch concurrently
-    const roomFetchPromises: { matchIdx: number; room: any; anchorIdx: number }[] = [];
-    const matchDataList: any[] = [];
-
-    for (let i = 0; i < js.data.length; i++) {
-      const it = js.data[i];
+    for (const it of js.data) {
       const mt = it.matchTime;
+
       if (!mt || typeof mt !== "number") continue;
+
       let status: string;
       if (now >= mt && now <= mt + 3 * 60 * 60 * 1000) status = "live";
       else if (now > mt + 3 * 60 * 60 * 1000) status = "finished";
       else status = "upcoming";
 
-      matchDataList.push({ it, status, mt });
-
+      const servers: any[] = [];
       if (status === "live" && it.anchors) {
         const anchorSlice = it.anchors.slice(0, 3);
-        for (let j = 0; j < anchorSlice.length; j++) {
-          const a = anchorSlice[j];
+        for (const a of anchorSlice) {
           const room = a.anchor?.roomNum;
           if (!room) continue;
-          roomFetchPromises.push({ matchIdx: matchDataList.length - 1, room, anchorIdx: j });
+          const { m3u8, hdM3u8 } = await fetchServerURL(room);
+          if (m3u8) servers.push({ name: "Soco SD", stream_url: m3u8 });
+          if (hdM3u8) servers.push({ name: "Soco HD", stream_url: hdM3u8 });
         }
       }
-    }
-
-    // Fetch all room URLs concurrently (big performance improvement!)
-    const roomResults = await Promise.allSettled(
-      roomFetchPromises.map((r) => fetchServerURL(r.room))
-    );
-
-    // Build a map: matchIdx -> servers[]
-    const serversMap = new Map<number, any[]>();
-    for (let k = 0; k < roomFetchPromises.length; k++) {
-      const { matchIdx } = roomFetchPromises[k];
-      const result = roomResults[k];
-      if (result.status !== "fulfilled") continue;
-      const { m3u8, hdM3u8 } = result.value;
-      if (!serversMap.has(matchIdx)) serversMap.set(matchIdx, []);
-      const servers = serversMap.get(matchIdx)!;
-      if (m3u8) {
-        const sdToken = createStreamToken(m3u8);
-        servers.push({ name: "Soco SD", token: sdToken });
-      }
-      if (hdM3u8) {
-        const hdToken = createStreamToken(hdM3u8);
-        servers.push({ name: "Soco HD", token: hdToken });
-      }
-    }
-
-    for (let i = 0; i < matchDataList.length; i++) {
-      const { it, status, mt } = matchDataList[i];
-      const servers = serversMap.get(i) || [];
 
       const homeLogo = sanitizeUrl(
         it.homeLogo || it.hostLogo || it.homeIcon || it.hostIcon
@@ -1873,17 +1188,6 @@ async function fetchMatches(date: string) {
       const awayLogo = sanitizeUrl(
         it.awayLogo || it.guestLogo || it.awayIcon || it.guestIcon
       );
-
-      let homeLogoProxied: string | null = null;
-      let awayLogoProxied: string | null = null;
-      if (homeLogo) {
-        const logoToken = createStreamToken(homeLogo);
-        homeLogoProxied = "/api/img-proxy?token=" + logoToken;
-      }
-      if (awayLogo) {
-        const logoToken = createStreamToken(awayLogo);
-        awayLogoProxied = "/api/img-proxy?token=" + logoToken;
-      }
 
       const homeTeamName = sanitizeText(
         it.homeName || it.hostName || "Home",
@@ -1897,24 +1201,29 @@ async function fetchMatches(date: string) {
         it.leagueName || it.subCateName || "Unknown League",
         80
       );
+
       let matchScore: string | null = null;
       if (it.homeScore !== undefined && it.homeScore !== null) {
         const hs = String(it.homeScore).replace(/[^0-9]/g, "").slice(0, 3);
         const as = String(it.awayScore).replace(/[^0-9]/g, "").slice(0, 3);
         matchScore = `${hs} - ${as}`;
       }
+
+      // ---- Compute match_day label ----
       const matchDateStr = new Intl.DateTimeFormat("en-CA", {
         timeZone: "Asia/Yangon",
         year: "numeric",
         month: "2-digit",
         day: "2-digit",
       }).format(new Date(mt));
+
       const todayDateStr = new Intl.DateTimeFormat("en-CA", {
         timeZone: "Asia/Yangon",
         year: "numeric",
         month: "2-digit",
         day: "2-digit",
       }).format(new Date());
+
       const tomorrowD = new Date();
       tomorrowD.setDate(tomorrowD.getDate() + 1);
       const tomorrowDateStr = new Intl.DateTimeFormat("en-CA", {
@@ -1923,6 +1232,7 @@ async function fetchMatches(date: string) {
         month: "2-digit",
         day: "2-digit",
       }).format(tomorrowD);
+
       const yesterdayD = new Date();
       yesterdayD.setDate(yesterdayD.getDate() - 1);
       const yesterdayDateStr = new Intl.DateTimeFormat("en-CA", {
@@ -1931,6 +1241,7 @@ async function fetchMatches(date: string) {
         month: "2-digit",
         day: "2-digit",
       }).format(yesterdayD);
+
       let matchDay: string;
       if (matchDateStr === todayDateStr) {
         matchDay = "Today";
@@ -1941,6 +1252,7 @@ async function fetchMatches(date: string) {
       } else {
         matchDay = matchDateStr;
       }
+
       results.push({
         match_time: new Date(mt).toLocaleTimeString("en-US", {
           timeZone: "Asia/Yangon",
@@ -1952,8 +1264,8 @@ async function fetchMatches(date: string) {
         match_status: status,
         home_team_name: homeTeamName,
         away_team_name: awayTeamName,
-        home_team_logo: homeLogoProxied,
-        away_team_logo: awayLogoProxied,
+        home_team_logo: homeLogo,
+        away_team_logo: awayLogo,
         league_name: leagueName,
         match_score: matchScore,
         servers,
