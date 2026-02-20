@@ -9,14 +9,65 @@ const API_USER_AGENT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36";
 
 // ====== Developer Contact Info ======
-const DEV_CONTACT_URL = Deno.env.get("DEV_CONTACT_URL") || "https://t.me/yourusername";
-const DEV_PROFILE_IMG = Deno.env.get("DEV_PROFILE_IMG") || "https://ui-avatars.com/api/?name=Dev&background=d97706&color=fff&size=128";
+const DEV_CONTACT_URL =
+  Deno.env.get("DEV_CONTACT_URL") || "https://t.me/yourusername";
+const DEV_PROFILE_IMG =
+  Deno.env.get("DEV_PROFILE_IMG") ||
+  "https://ui-avatars.com/api/?name=Dev&background=d97706&color=fff&size=128";
 const DEV_DISPLAY_NAME = Deno.env.get("DEV_DISPLAY_NAME") || "Developer";
+
+// ====== SECURITY: HMAC Secret for signed proxy URLs ======
+const PROXY_SECRET =
+  Deno.env.get("PROXY_SECRET") ||
+  crypto.getRandomValues(new Uint8Array(32)).reduce(
+    (s, b) => s + b.toString(16).padStart(2, "0"),
+    ""
+  );
+const TOKEN_EXPIRY_MS = 4 * 60 * 60 * 1000; // 4 hours
+
+async function generateProxyToken(
+  url: string,
+  timestamp: number
+): Promise<string> {
+  const encoder = new TextEncoder();
+  const key = await crypto.subtle.importKey(
+    "raw",
+    encoder.encode(PROXY_SECRET),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+  const data = encoder.encode(`${url}|${timestamp}`);
+  const sig = await crypto.subtle.sign("HMAC", key, data);
+  return Array.from(new Uint8Array(sig))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+async function verifyProxyToken(
+  url: string,
+  timestamp: number,
+  token: string
+): Promise<boolean> {
+  const expected = await generateProxyToken(url, timestamp);
+  if (expected.length !== token.length) return false;
+  // Constant-time comparison
+  let diff = 0;
+  for (let i = 0; i < expected.length; i++) {
+    diff |= expected.charCodeAt(i) ^ token.charCodeAt(i);
+  }
+  return diff === 0;
+}
 
 // ====== SECURITY: Rate Limiter ======
 const rateLimitMap = new Map<string, { count: number; resetTime: number }>();
+const streamRateLimitMap = new Map<
+  string,
+  { count: number; resetTime: number }
+>();
 const RATE_LIMIT_WINDOW = 60_000;
 const RATE_LIMIT_MAX = 60;
+const STREAM_RATE_LIMIT_MAX = 120;
 const BLOCK_THRESHOLD = 200;
 const blockedIPs = new Map<string, number>();
 
@@ -29,7 +80,10 @@ function getClientIP(req: Request): string {
   );
 }
 
-function isRateLimited(ip: string): { limited: boolean; blocked: boolean } {
+function isRateLimited(
+  ip: string,
+  isStream: boolean = false
+): { limited: boolean; blocked: boolean } {
   const now = Date.now();
 
   const blockExpiry = blockedIPs.get(ip);
@@ -39,9 +93,12 @@ function isRateLimited(ip: string): { limited: boolean; blocked: boolean } {
     blockedIPs.delete(ip);
   }
 
-  const entry = rateLimitMap.get(ip);
+  const map = isStream ? streamRateLimitMap : rateLimitMap;
+  const maxLimit = isStream ? STREAM_RATE_LIMIT_MAX : RATE_LIMIT_MAX;
+
+  const entry = map.get(ip);
   if (!entry || now > entry.resetTime) {
-    rateLimitMap.set(ip, { count: 1, resetTime: now + RATE_LIMIT_WINDOW });
+    map.set(ip, { count: 1, resetTime: now + RATE_LIMIT_WINDOW });
     return { limited: false, blocked: false };
   }
 
@@ -52,7 +109,7 @@ function isRateLimited(ip: string): { limited: boolean; blocked: boolean } {
     return { limited: true, blocked: true };
   }
 
-  if (entry.count > RATE_LIMIT_MAX) {
+  if (entry.count > maxLimit) {
     return { limited: true, blocked: false };
   }
 
@@ -65,10 +122,67 @@ setInterval(() => {
   for (const [ip, entry] of rateLimitMap) {
     if (now > entry.resetTime) rateLimitMap.delete(ip);
   }
+  for (const [ip, entry] of streamRateLimitMap) {
+    if (now > entry.resetTime) streamRateLimitMap.delete(ip);
+  }
   for (const [ip, expiry] of blockedIPs) {
     if (now > expiry) blockedIPs.delete(ip);
   }
 }, 5 * 60_000);
+
+// ====== SECURITY: SSRF Protection - Block private/internal IPs ======
+function isPrivateUrl(urlStr: string): boolean {
+  try {
+    const parsed = new URL(urlStr);
+    const hostname = parsed.hostname.toLowerCase();
+
+    // Block localhost
+    if (
+      hostname === "localhost" ||
+      hostname === "127.0.0.1" ||
+      hostname === "::1" ||
+      hostname === "[::1]" ||
+      hostname === "0.0.0.0"
+    )
+      return true;
+
+    // Block private IP ranges
+    const ipMatch = hostname.match(
+      /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/
+    );
+    if (ipMatch) {
+      const [, a, b] = ipMatch.map(Number);
+      if (a === 10) return true; // 10.0.0.0/8
+      if (a === 172 && b >= 16 && b <= 31) return true; // 172.16.0.0/12
+      if (a === 192 && b === 168) return true; // 192.168.0.0/16
+      if (a === 169 && b === 254) return true; // 169.254.0.0/16 (link-local)
+      if (a === 127) return true; // 127.0.0.0/8
+      if (a === 0) return true; // 0.0.0.0/8
+    }
+
+    // Block common internal hostnames
+    if (
+      hostname.endsWith(".local") ||
+      hostname.endsWith(".internal") ||
+      hostname.endsWith(".corp") ||
+      hostname === "metadata.google.internal" ||
+      hostname === "metadata" ||
+      hostname.startsWith("169.254.")
+    )
+      return true;
+
+    // Block cloud metadata endpoints
+    if (hostname === "169.254.169.254") return true;
+
+    // Block non-http(s) schemes just in case
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:")
+      return true;
+
+    return false;
+  } catch {
+    return true;
+  }
+}
 
 // ====== SECURITY: Suspicious Request Detection ======
 function isSuspiciousRequest(req: Request): boolean {
@@ -77,13 +191,23 @@ function isSuspiciousRequest(req: Request): boolean {
 
   if (!ua || ua.length < 10) return true;
 
+  // Only block known attack tools, not general HTTP clients
   const botPatterns = [
-    /sqlmap/i, /nikto/i, /nmap/i, /masscan/i,
-    /dirbuster/i, /gobuster/i, /wfuzz/i, /hydra/i,
-    /burpsuite/i, /nessus/i, /openvas/i, /acunetix/i,
-    /zgrab/i, /nuclei/i, /httpx/i, /crawl.*bot/i,
-    /python-requests/i, /go-http-client/i, /curl\//i,
-    /wget\//i, /scrapy/i, /phantomjs/i, /headless/i,
+    /sqlmap/i,
+    /nikto/i,
+    /nmap/i,
+    /masscan/i,
+    /dirbuster/i,
+    /gobuster/i,
+    /wfuzz/i,
+    /hydra/i,
+    /burpsuite/i,
+    /nessus/i,
+    /openvas/i,
+    /acunetix/i,
+    /zgrab/i,
+    /nuclei/i,
+    /scrapy/i,
   ];
   if (botPatterns.some((p) => p.test(ua))) return true;
 
@@ -92,18 +216,36 @@ function isSuspiciousRequest(req: Request): boolean {
     return true;
 
   const maliciousPaths = [
-    /\.env/i, /\.git/i, /wp-admin/i, /wp-login/i,
-    /phpmyadmin/i, /admin/i, /\.php/i, /\.asp/i,
-    /shell/i, /eval/i, /exec/i, /config/i,
-    /\.sql/i, /backup/i, /\.bak/i, /\.log/i,
+    /\.env/i,
+    /\.git/i,
+    /wp-admin/i,
+    /wp-login/i,
+    /phpmyadmin/i,
+    /\/admin\b/i,
+    /\.php$/i,
+    /\.asp$/i,
+    /shell/i,
+    /eval\(/i,
+    /exec\(/i,
+    /\.sql$/i,
+    /backup/i,
+    /\.bak$/i,
+    /\.log$/i,
   ];
   if (maliciousPaths.some((p) => p.test(path))) return true;
 
   const query = url.search;
   const sqlPatterns = [
-    /union.*select/i, /or\s+1\s*=\s*1/i, /drop\s+table/i,
-    /insert\s+into/i, /delete\s+from/i, /script>/i,
-    /<iframe/i, /javascript:/i, /onerror/i, /onload/i,
+    /union.*select/i,
+    /or\s+1\s*=\s*1/i,
+    /drop\s+table/i,
+    /insert\s+into/i,
+    /delete\s+from/i,
+    /script>/i,
+    /<iframe/i,
+    /javascript:/i,
+    /onerror\s*=/i,
+    /onload\s*=/i,
   ];
   if (sqlPatterns.some((p) => p.test(query))) return true;
 
@@ -124,10 +266,31 @@ function securityHeaders(): Record<string, string> {
       "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; " +
       "font-src https://fonts.gstatic.com; " +
       "img-src 'self' https: data:; " +
-      "media-src 'self' https: blob:; " +
-      "connect-src 'self' https: blob:;",
+      "media-src 'self' blob:; " +
+      "connect-src 'self';",
     "Strict-Transport-Security": "max-age=31536000; includeSubDomains",
   };
+}
+
+// ====== SECURITY: Allowed content types for proxy ======
+const ALLOWED_PROXY_CONTENT_TYPES = [
+  "application/vnd.apple.mpegurl",
+  "application/x-mpegurl",
+  "video/mp2t",
+  "video/mp4",
+  "video/mpeg",
+  "video/x-flv",
+  "audio/aac",
+  "audio/mpeg",
+  "application/octet-stream",
+  "binary/octet-stream",
+  "text/plain", // some m3u8 served as text/plain
+];
+
+function isAllowedContentType(contentType: string): boolean {
+  if (!contentType) return true; // allow if no content-type (e.g., .ts segments)
+  const lower = contentType.toLowerCase().split(";")[0].trim();
+  return ALLOWED_PROXY_CONTENT_TYPES.some((t) => lower.includes(t));
 }
 
 // ====== SECURITY: Sanitize URL (only allow http/https) ======
@@ -141,7 +304,10 @@ function sanitizeUrl(url: string | null | undefined): string | null {
 }
 
 // ====== SECURITY: Sanitize plain text ======
-function sanitizeText(text: string | null | undefined, maxLen: number): string {
+function sanitizeText(
+  text: string | null | undefined,
+  maxLen: number
+): string {
   if (!text || typeof text !== "string") return "";
   return text
     .replace(/<[^>]*>/g, "")
@@ -150,15 +316,96 @@ function sanitizeText(text: string | null | undefined, maxLen: number): string {
     .slice(0, maxLen);
 }
 
+// ====== SECURITY: Validate referer for proxy requests ======
+function isValidProxyReferer(req: Request): boolean {
+  const referer = req.headers.get("referer");
+  const origin = req.headers.get("origin");
+  const host = req.headers.get("host");
+
+  if (!host) return false;
+
+  // Allow if referer or origin matches our host
+  if (referer) {
+    try {
+      const refUrl = new URL(referer);
+      if (refUrl.host === host) return true;
+    } catch {
+      /* ignore */
+    }
+  }
+
+  if (origin) {
+    try {
+      const origUrl = new URL(origin);
+      if (origUrl.host === host) return true;
+    } catch {
+      /* ignore */
+    }
+  }
+
+  // Allow requests with no referer/origin (e.g., HLS player internal requests)
+  if (!referer && !origin) return true;
+
+  return false;
+}
+
 // ====== Stream Proxy Route ======
-async function handleStreamProxy(req: Request, url: URL): Promise<Response> {
+const MAX_PROXY_BODY_SIZE = 50 * 1024 * 1024; // 50MB limit
+
+async function handleStreamProxy(
+  req: Request,
+  url: URL
+): Promise<Response> {
+  // Validate referer
+  if (!isValidProxyReferer(req)) {
+    return new Response("Forbidden", {
+      status: 403,
+      headers: securityHeaders(),
+    });
+  }
+
   const streamUrl = url.searchParams.get("url");
+  const token = url.searchParams.get("token");
+  const ts = url.searchParams.get("ts");
+
   if (!streamUrl) {
-    return new Response("Missing url parameter", { status: 400, headers: securityHeaders() });
+    return new Response("Missing url parameter", {
+      status: 400,
+      headers: securityHeaders(),
+    });
   }
 
   if (!/^https?:\/\//i.test(streamUrl)) {
-    return new Response("Invalid URL", { status: 400, headers: securityHeaders() });
+    return new Response("Invalid URL", {
+      status: 400,
+      headers: securityHeaders(),
+    });
+  }
+
+  // SSRF Protection
+  if (isPrivateUrl(streamUrl)) {
+    return new Response("Forbidden", {
+      status: 403,
+      headers: securityHeaders(),
+    });
+  }
+
+  // Token verification for initial requests (not for rewritten m3u8 sub-requests)
+  if (token && ts) {
+    const timestamp = parseInt(ts, 10);
+    if (isNaN(timestamp) || Date.now() - timestamp > TOKEN_EXPIRY_MS) {
+      return new Response("Token expired", {
+        status: 403,
+        headers: securityHeaders(),
+      });
+    }
+    const valid = await verifyProxyToken(streamUrl, timestamp, token);
+    if (!valid) {
+      return new Response("Invalid token", {
+        status: 403,
+        headers: securityHeaders(),
+      });
+    }
   }
 
   try {
@@ -175,29 +422,97 @@ async function handleStreamProxy(req: Request, url: URL): Promise<Response> {
     clearTimeout(timeout);
 
     if (!proxyRes.ok) {
-      return new Response("Stream unavailable", { status: 502, headers: securityHeaders() });
+      return new Response("Stream unavailable", {
+        status: 502,
+        headers: securityHeaders(),
+      });
     }
 
     const contentType = proxyRes.headers.get("content-type") || "";
-    const body = proxyRes.body;
 
-    if (streamUrl.endsWith(".m3u8") || contentType.includes("mpegurl") || contentType.includes("m3u8")) {
+    // Content-type validation (skip for .ts and .m3u8 files where content-type may be wrong)
+    if (
+      contentType &&
+      !streamUrl.endsWith(".ts") &&
+      !streamUrl.endsWith(".m3u8") &&
+      !streamUrl.endsWith(".m4s") &&
+      !streamUrl.endsWith(".aac") &&
+      !streamUrl.endsWith(".key") &&
+      !isAllowedContentType(contentType)
+    ) {
+      return new Response("Unsupported content type", {
+        status: 403,
+        headers: securityHeaders(),
+      });
+    }
+
+    if (
+      streamUrl.endsWith(".m3u8") ||
+      contentType.includes("mpegurl") ||
+      contentType.includes("m3u8")
+    ) {
       const text = await proxyRes.text();
-      const baseUrl = streamUrl.substring(0, streamUrl.lastIndexOf("/") + 1);
 
-      const rewritten = text.split("\n").map((line: string) => {
-        const trimmed = line.trim();
-        if (trimmed && !trimmed.startsWith("#")) {
-          let absoluteUrl: string;
-          if (/^https?:\/\//i.test(trimmed)) {
-            absoluteUrl = trimmed;
-          } else {
-            absoluteUrl = baseUrl + trimmed;
+      // Validate m3u8 content (should start with #EXTM3U or contain HLS tags)
+      const trimmedText = text.trim();
+      if (
+        trimmedText.length > 0 &&
+        !trimmedText.startsWith("#EXTM3U") &&
+        !trimmedText.startsWith("#EXT")
+      ) {
+        return new Response("Invalid m3u8 content", {
+          status: 502,
+          headers: securityHeaders(),
+        });
+      }
+
+      const baseUrl =
+        streamUrl.substring(0, streamUrl.lastIndexOf("/") + 1);
+
+      const rewritten = text
+        .split("\n")
+        .map((line: string) => {
+          const trimmed = line.trim();
+          if (trimmed && !trimmed.startsWith("#")) {
+            let absoluteUrl: string;
+            if (/^https?:\/\//i.test(trimmed)) {
+              absoluteUrl = trimmed;
+            } else {
+              absoluteUrl = baseUrl + trimmed;
+            }
+            // SSRF check on rewritten URLs too
+            if (isPrivateUrl(absoluteUrl)) {
+              return "# blocked-private-url";
+            }
+            return (
+              "/api/stream-proxy?url=" + encodeURIComponent(absoluteUrl)
+            );
           }
-          return "/api/stream-proxy?url=" + encodeURIComponent(absoluteUrl);
-        }
-        return line;
-      }).join("\n");
+          // Also rewrite URI= references in #EXT-X-KEY and similar tags
+          if (trimmed.startsWith("#") && trimmed.includes('URI="')) {
+            return line.replace(
+              /URI="([^"]+)"/g,
+              (_match: string, uri: string) => {
+                let absoluteUri: string;
+                if (/^https?:\/\//i.test(uri)) {
+                  absoluteUri = uri;
+                } else {
+                  absoluteUri = baseUrl + uri;
+                }
+                if (isPrivateUrl(absoluteUri)) {
+                  return 'URI=""';
+                }
+                return (
+                  'URI="/api/stream-proxy?url=' +
+                  encodeURIComponent(absoluteUri) +
+                  '"'
+                );
+              }
+            );
+          }
+          return line;
+        })
+        .join("\n");
 
       return new Response(rewritten, {
         status: 200,
@@ -210,6 +525,15 @@ async function handleStreamProxy(req: Request, url: URL): Promise<Response> {
       });
     }
 
+    // For non-m3u8 responses, enforce size limit
+    const contentLength = proxyRes.headers.get("content-length");
+    if (contentLength && parseInt(contentLength) > MAX_PROXY_BODY_SIZE) {
+      return new Response("Response too large", {
+        status: 502,
+        headers: securityHeaders(),
+      });
+    }
+
     const resHeaders: Record<string, string> = {
       "Access-Control-Allow-Origin": "*",
       "Cache-Control": "public, max-age=10",
@@ -219,15 +543,22 @@ async function handleStreamProxy(req: Request, url: URL): Promise<Response> {
       resHeaders["Content-Type"] = contentType;
     } else if (streamUrl.endsWith(".ts")) {
       resHeaders["Content-Type"] = "video/mp2t";
+    } else if (streamUrl.endsWith(".m4s")) {
+      resHeaders["Content-Type"] = "video/iso.segment";
+    } else if (streamUrl.endsWith(".aac")) {
+      resHeaders["Content-Type"] = "audio/aac";
     }
 
-    return new Response(body, {
+    return new Response(proxyRes.body, {
       status: 200,
       headers: resHeaders,
     });
   } catch (e: any) {
     console.warn("Stream proxy error:", e.message);
-    return new Response("Stream error", { status: 502, headers: securityHeaders() });
+    return new Response("Stream error", {
+      status: 502,
+      headers: securityHeaders(),
+    });
   }
 }
 
@@ -235,7 +566,9 @@ serve(async (req) => {
   const url = new URL(req.url);
   const clientIP = getClientIP(req);
 
-  const { limited, blocked } = isRateLimited(clientIP);
+  const isStreamReq = url.pathname === "/api/stream-proxy";
+
+  const { limited, blocked } = isRateLimited(clientIP, isStreamReq);
   if (blocked) {
     return new Response(
       JSON.stringify({ error: "Blocked: Too many requests. Try again later." }),
@@ -264,7 +597,10 @@ serve(async (req) => {
   }
 
   if (isSuspiciousRequest(req)) {
-    return new Response("Not Found", { status: 404, headers: securityHeaders() });
+    return new Response("Not Found", {
+      status: 404,
+      headers: securityHeaders(),
+    });
   }
 
   if (req.method !== "GET") {
@@ -329,12 +665,51 @@ serve(async (req) => {
     }
   }
 
-  // --- 2. API ROUTE: Stream Proxy ---
+  // --- 2. API ROUTE: Generate signed proxy URL ---
+  if (url.pathname === "/api/proxy-token") {
+    const targetUrl = url.searchParams.get("url");
+    if (!targetUrl || !/^https?:\/\//i.test(targetUrl)) {
+      return new Response(JSON.stringify({ error: "Invalid URL" }), {
+        status: 400,
+        headers: {
+          "Content-Type": "application/json",
+          ...securityHeaders(),
+        },
+      });
+    }
+    if (isPrivateUrl(targetUrl)) {
+      return new Response(JSON.stringify({ error: "Forbidden" }), {
+        status: 403,
+        headers: {
+          "Content-Type": "application/json",
+          ...securityHeaders(),
+        },
+      });
+    }
+    const ts = Date.now();
+    const token = await generateProxyToken(targetUrl, ts);
+    const signedUrl =
+      "/api/stream-proxy?url=" +
+      encodeURIComponent(targetUrl) +
+      "&ts=" +
+      ts +
+      "&token=" +
+      token;
+    return new Response(JSON.stringify({ url: signedUrl }), {
+      headers: {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store",
+        ...securityHeaders(),
+      },
+    });
+  }
+
+  // --- 3. API ROUTE: Stream Proxy ---
   if (url.pathname === "/api/stream-proxy") {
     return await handleStreamProxy(req, url);
   }
 
-  // --- 3. FRONTEND UI (HTML) ---
+  // --- 4. FRONTEND UI (HTML) ---
   if (url.pathname === "/") {
     return new Response(getHTML(), {
       headers: {
@@ -344,7 +719,10 @@ serve(async (req) => {
     });
   }
 
-  return new Response("Not Found", { status: 404, headers: securityHeaders() });
+  return new Response("Not Found", {
+    status: 404,
+    headers: securityHeaders(),
+  });
 });
 
 // ====== FRONTEND HTML ======
@@ -760,16 +1138,10 @@ function getHTML(): string {
             <h1 class="header-title text-xl">All Sports Live</h1>
             <p class="header-subtitle mt-0.5">Premium Sports Streaming</p>
           </div>
-          <div class="flex items-center gap-3">
-            <a href="${safeDevUrl}" target="_blank" rel="noopener noreferrer" title="Contact ${safeDevName}" class="dev-contact-link">
-              <img src="${safeDevImg}" alt="${safeDevName}" class="dev-avatar" onerror="this.style.display='none'">
-              <span class="dev-name">${safeDevName}</span>
-            </a>
-            <div class="text-right">
-              <div class="text-[10px] text-slate-400 font-medium">Myanmar Time</div>
-              <div id="clock" class="text-sm font-bold text-slate-600 font-mono tracking-wide">--:--</div>
-            </div>
-          </div>
+          <a href="${safeDevUrl}" target="_blank" rel="noopener noreferrer" title="Contact ${safeDevName}" class="dev-contact-link">
+            <img src="${safeDevImg}" alt="${safeDevName}" class="dev-avatar" onerror="this.style.display='none'">
+            <span class="dev-name">${safeDevName}</span>
+          </a>
         </div>
       </div>
     </div>
@@ -839,19 +1211,6 @@ function getHTML(): string {
       div.textContent = str;
       return div.innerHTML;
     }
-
-    function updateClock() {
-      try {
-        var now = new Date();
-        var mmTime = now.toLocaleTimeString("en-US", {
-          timeZone: "Asia/Yangon",
-          hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: true
-        });
-        document.getElementById("clock").textContent = mmTime;
-      } catch(e) {}
-    }
-    updateClock();
-    setInterval(updateClock, 1000);
 
     document.getElementById("tabs").addEventListener("click", function(e) {
       var btn = e.target.closest(".tab-btn");
@@ -1099,13 +1458,23 @@ function getHTML(): string {
       if (existing) existing.remove();
     }
 
-    function play(originalUrl) {
+    async function play(originalUrl) {
       if (!originalUrl || typeof originalUrl !== "string") return;
       if (!/^https?:\\/\\//i.test(originalUrl)) return;
 
       currentStreamUrl = originalUrl;
 
-      var proxyUrl = "/api/stream-proxy?url=" + encodeURIComponent(originalUrl);
+      // Get signed proxy URL from server
+      var proxyUrl;
+      try {
+        var tokenRes = await fetch("/api/proxy-token?url=" + encodeURIComponent(originalUrl));
+        if (!tokenRes.ok) throw new Error("Failed to get stream token");
+        var tokenData = await tokenRes.json();
+        proxyUrl = tokenData.url;
+      } catch (e) {
+        showPlayerError("Failed to initialize stream. Please try again.");
+        return;
+      }
 
       document.getElementById("player-container").classList.remove("hidden");
       clearPlayerError();
@@ -1128,6 +1497,8 @@ function getHTML(): string {
           maxBufferLength: 30,
           maxMaxBufferLength: 60,
           xhrSetup: function(xhr, url) {
+            // Internal sub-requests (rewritten m3u8 URLs) already point to /api/stream-proxy
+            // Only rewrite if it's an absolute external URL that wasn't rewritten
             if (url.indexOf("/api/stream-proxy") === -1 && /^https?:\\/\\//i.test(url)) {
               xhr.open("GET", "/api/stream-proxy?url=" + encodeURIComponent(url), true);
             }
