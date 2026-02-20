@@ -13,20 +13,43 @@ const DEV_CONTACT_URL = Deno.env.get("DEV_CONTACT_URL") || "https://t.me/youruse
 const DEV_PROFILE_IMG = Deno.env.get("DEV_PROFILE_IMG") || "https://ui-avatars.com/api/?name=Dev&background=d97706&color=fff&size=128";
 const DEV_DISPLAY_NAME = Deno.env.get("DEV_DISPLAY_NAME") || "Developer";
 
+// ====== SECURITY: Allowed stream domains (whitelist) ======
+const ALLOWED_STREAM_DOMAINS: string[] = (() => {
+  const envDomains = Deno.env.get("ALLOWED_STREAM_DOMAINS");
+  if (envDomains) {
+    return envDomains.split(",").map(d => d.trim().toLowerCase()).filter(Boolean);
+  }
+  return [];
+})();
+
 // ====== SECURITY: Rate Limiter ======
 const rateLimitMap = new Map<string, { count: number; resetTime: number }>();
 const RATE_LIMIT_WINDOW = 60_000;
 const RATE_LIMIT_MAX = 60;
 const BLOCK_THRESHOLD = 200;
+const RATE_LIMIT_MAP_MAX_SIZE = 50_000; // Prevent memory exhaustion
 const blockedIPs = new Map<string, number>();
 
 function getClientIP(req: Request): string {
-  return (
-    req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ||
-    req.headers.get("cf-connecting-ip") ||
-    req.headers.get("x-real-ip") ||
-    "unknown"
-  );
+  // In production behind a trusted reverse proxy (e.g., Deno Deploy, Cloudflare),
+  // cf-connecting-ip is set by Cloudflare and is trustworthy.
+  // x-forwarded-for can be spoofed if not behind trusted proxy.
+  // Prioritize cf-connecting-ip > x-real-ip > x-forwarded-for last entry
+  const cfIP = req.headers.get("cf-connecting-ip");
+  if (cfIP) return cfIP.trim();
+
+  const realIP = req.headers.get("x-real-ip");
+  if (realIP) return realIP.trim();
+
+  const xff = req.headers.get("x-forwarded-for");
+  if (xff) {
+    // Use the LAST entry (closest to reverse proxy) to reduce spoofing risk
+    // when behind a single trusted proxy. If behind multiple, adjust accordingly.
+    const parts = xff.split(",").map(s => s.trim()).filter(Boolean);
+    if (parts.length > 0) return parts[parts.length - 1];
+  }
+
+  return "unknown";
 }
 
 function isRateLimited(ip: string): { limited: boolean; blocked: boolean } {
@@ -41,6 +64,17 @@ function isRateLimited(ip: string): { limited: boolean; blocked: boolean } {
 
   const entry = rateLimitMap.get(ip);
   if (!entry || now > entry.resetTime) {
+    // Prevent memory exhaustion: if map is too large, clear old entries
+    if (rateLimitMap.size >= RATE_LIMIT_MAP_MAX_SIZE) {
+      const cutoff = now - RATE_LIMIT_WINDOW;
+      for (const [key, val] of rateLimitMap) {
+        if (val.resetTime < cutoff) rateLimitMap.delete(key);
+      }
+      // If still too large after cleanup, reject (defensive)
+      if (rateLimitMap.size >= RATE_LIMIT_MAP_MAX_SIZE) {
+        return { limited: true, blocked: false };
+      }
+    }
     rateLimitMap.set(ip, { count: 1, resetTime: now + RATE_LIMIT_WINDOW });
     return { limited: false, blocked: false };
   }
@@ -110,8 +144,92 @@ function isSuspiciousRequest(req: Request): boolean {
   return false;
 }
 
+// ====== SECURITY: SSRF Prevention - Block internal/private IPs ======
+function isInternalUrl(urlStr: string): boolean {
+  try {
+    const parsed = new URL(urlStr);
+    const hostname = parsed.hostname.toLowerCase();
+
+    // Block localhost variants
+    if (
+      hostname === "localhost" ||
+      hostname === "127.0.0.1" ||
+      hostname === "[::1]" ||
+      hostname === "::1" ||
+      hostname === "0.0.0.0"
+    ) {
+      return true;
+    }
+
+    // Block private IP ranges
+    const privatePatterns = [
+      /^10\.\d{1,3}\.\d{1,3}\.\d{1,3}$/,        // 10.0.0.0/8
+      /^172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}$/, // 172.16.0.0/12
+      /^192\.168\.\d{1,3}\.\d{1,3}$/,              // 192.168.0.0/16
+      /^169\.254\.\d{1,3}\.\d{1,3}$/,              // Link-local
+      /^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.\d{1,3}\.\d{1,3}$/, // CGN 100.64.0.0/10
+      /^0\.0\.0\.0$/,
+      /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/,         // 127.0.0.0/8
+    ];
+    if (privatePatterns.some(p => p.test(hostname))) return true;
+
+    // Block .local, .internal, .corp, etc.
+    if (
+      hostname.endsWith(".local") ||
+      hostname.endsWith(".internal") ||
+      hostname.endsWith(".corp") ||
+      hostname.endsWith(".lan") ||
+      hostname.endsWith(".home")
+    ) {
+      return true;
+    }
+
+    // Block metadata endpoints (AWS, GCP, Azure)
+    if (
+      hostname === "169.254.169.254" ||
+      hostname === "metadata.google.internal" ||
+      hostname === "metadata.google.com"
+    ) {
+      return true;
+    }
+
+    // Block non-http(s) schemes
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      return true;
+    }
+
+    return false;
+  } catch {
+    return true; // If URL parsing fails, treat as internal/unsafe
+  }
+}
+
+// ====== SECURITY: Check if stream URL domain is allowed ======
+function isAllowedStreamDomain(urlStr: string): boolean {
+  // If no whitelist configured, allow all non-internal URLs (backward compat)
+  if (ALLOWED_STREAM_DOMAINS.length === 0) return true;
+
+  try {
+    const parsed = new URL(urlStr);
+    const hostname = parsed.hostname.toLowerCase();
+    return ALLOWED_STREAM_DOMAINS.some(domain => {
+      return hostname === domain || hostname.endsWith("." + domain);
+    });
+  } catch {
+    return false;
+  }
+}
+
 // ====== SECURITY: Response Headers ======
-function securityHeaders(): Record<string, string> {
+function securityHeaders(nonce?: string): Record<string, string> {
+  const cspNonce = nonce || "";
+  const scriptSrc = cspNonce
+    ? `'nonce-${cspNonce}' https://cdn.tailwindcss.com https://cdn.jsdelivr.net`
+    : "'self' 'unsafe-inline' https://cdn.tailwindcss.com https://cdn.jsdelivr.net";
+  const styleSrc = cspNonce
+    ? `'self' 'nonce-${cspNonce}' https://fonts.googleapis.com`
+    : "'self' 'unsafe-inline' https://fonts.googleapis.com";
+
   return {
     "X-Content-Type-Options": "nosniff",
     "X-Frame-Options": "DENY",
@@ -120,14 +238,24 @@ function securityHeaders(): Record<string, string> {
     "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
     "Content-Security-Policy":
       "default-src 'self'; " +
-      "script-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com https://cdn.jsdelivr.net; " +
-      "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; " +
+      `script-src ${scriptSrc}; ` +
+      `style-src ${styleSrc}; ` +
       "font-src https://fonts.gstatic.com; " +
       "img-src 'self' https: data:; " +
       "media-src 'self' https: blob:; " +
-      "connect-src 'self' https: blob:;",
+      "connect-src 'self' https: blob:; " +
+      "frame-ancestors 'none'; " +
+      "base-uri 'self'; " +
+      "form-action 'self';",
     "Strict-Transport-Security": "max-age=31536000; includeSubDomains",
   };
+}
+
+// ====== SECURITY: Generate CSP Nonce ======
+function generateNonce(): string {
+  const array = new Uint8Array(16);
+  crypto.getRandomValues(array);
+  return btoa(String.fromCharCode(...array)).replace(/[+/=]/g, "");
 }
 
 // ====== SECURITY: Sanitize URL (only allow http/https) ======
@@ -161,6 +289,16 @@ async function handleStreamProxy(req: Request, url: URL): Promise<Response> {
     return new Response("Invalid URL", { status: 400, headers: securityHeaders() });
   }
 
+  // SSRF prevention: block internal/private URLs
+  if (isInternalUrl(streamUrl)) {
+    return new Response("Forbidden", { status: 403, headers: securityHeaders() });
+  }
+
+  // Domain whitelist check
+  if (!isAllowedStreamDomain(streamUrl)) {
+    return new Response("Forbidden: domain not allowed", { status: 403, headers: securityHeaders() });
+  }
+
   try {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 15000);
@@ -171,6 +309,7 @@ async function handleStreamProxy(req: Request, url: URL): Promise<Response> {
         Referer: API_REFERER,
       },
       signal: controller.signal,
+      redirect: "follow",
     });
     clearTimeout(timeout);
 
@@ -178,11 +317,23 @@ async function handleStreamProxy(req: Request, url: URL): Promise<Response> {
       return new Response("Stream unavailable", { status: 502, headers: securityHeaders() });
     }
 
+    // Validate response size (prevent proxying huge files)
+    const contentLength = proxyRes.headers.get("content-length");
+    if (contentLength && parseInt(contentLength) > 50 * 1024 * 1024) {
+      return new Response("Response too large", { status: 502, headers: securityHeaders() });
+    }
+
     const contentType = proxyRes.headers.get("content-type") || "";
     const body = proxyRes.body;
 
     if (streamUrl.endsWith(".m3u8") || contentType.includes("mpegurl") || contentType.includes("m3u8")) {
       const text = await proxyRes.text();
+
+      // Validate m3u8 content size
+      if (text.length > 1024 * 1024) {
+        return new Response("Playlist too large", { status: 502, headers: securityHeaders() });
+      }
+
       const baseUrl = streamUrl.substring(0, streamUrl.lastIndexOf("/") + 1);
 
       const rewritten = text.split("\n").map((line: string) => {
@@ -194,6 +345,8 @@ async function handleStreamProxy(req: Request, url: URL): Promise<Response> {
           } else {
             absoluteUrl = baseUrl + trimmed;
           }
+          // Validate the resolved URL too
+          if (isInternalUrl(absoluteUrl)) return "";
           return "/api/stream-proxy?url=" + encodeURIComponent(absoluteUrl);
         }
         return line;
@@ -208,6 +361,16 @@ async function handleStreamProxy(req: Request, url: URL): Promise<Response> {
           ...securityHeaders(),
         },
       });
+    }
+
+    // For non-m3u8: only allow expected content types for stream segments
+    const allowedTypes = [
+      "video/mp2t", "video/", "application/octet-stream",
+      "audio/", "application/vnd.apple.mpegurl", "binary/octet-stream",
+    ];
+    const isAllowedType = !contentType || allowedTypes.some(t => contentType.includes(t));
+    if (!isAllowedType) {
+      return new Response("Invalid content type", { status: 403, headers: securityHeaders() });
     }
 
     const resHeaders: Record<string, string> = {
@@ -336,10 +499,11 @@ serve(async (req) => {
 
   // --- 3. FRONTEND UI (HTML) ---
   if (url.pathname === "/") {
-    return new Response(getHTML(), {
+    const nonce = generateNonce();
+    return new Response(getHTML(nonce), {
       headers: {
         "Content-Type": "text/html; charset=utf-8",
-        ...securityHeaders(),
+        ...securityHeaders(nonce),
       },
     });
   }
@@ -348,7 +512,7 @@ serve(async (req) => {
 });
 
 // ====== FRONTEND HTML ======
-function getHTML(): string {
+function getHTML(nonce: string): string {
   const safeDevUrl = sanitizeUrl(DEV_CONTACT_URL) || "#";
   const safeDevImg = sanitizeUrl(DEV_PROFILE_IMG) || "";
   const safeDevName = sanitizeText(DEV_DISPLAY_NAME, 50) || "Developer";
@@ -359,10 +523,10 @@ function getHTML(): string {
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
   <title>All Sports Live</title>
-  <script src="https://cdn.tailwindcss.com"><\/script>
-  <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"><\/script>
+  <script nonce="${nonce}" src="https://cdn.tailwindcss.com"><\/script>
+  <script nonce="${nonce}" src="https://cdn.jsdelivr.net/npm/hls.js@latest"><\/script>
   <link href="https://fonts.googleapis.com/css2?family=Padauk:wght@400;700&family=Inter:wght@300;400;500;600;700;800;900&display=swap" rel="stylesheet">
-  <style>
+  <style nonce="${nonce}">
     * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
 
     body {
@@ -760,16 +924,10 @@ function getHTML(): string {
             <h1 class="header-title text-xl">All Sports Live</h1>
             <p class="header-subtitle mt-0.5">Premium Sports Streaming</p>
           </div>
-          <div class="flex items-center gap-3">
-            <a href="${safeDevUrl}" target="_blank" rel="noopener noreferrer" title="Contact ${safeDevName}" class="dev-contact-link">
-              <img src="${safeDevImg}" alt="${safeDevName}" class="dev-avatar" onerror="this.style.display='none'">
-              <span class="dev-name">${safeDevName}</span>
-            </a>
-            <div class="text-right">
-              <div class="text-[10px] text-slate-400 font-medium">Myanmar Time</div>
-              <div id="clock" class="text-sm font-bold text-slate-600 font-mono tracking-wide">--:--</div>
-            </div>
-          </div>
+          <a href="${safeDevUrl}" target="_blank" rel="noopener noreferrer" title="Contact ${safeDevName}" class="dev-contact-link">
+            <img src="${safeDevImg}" alt="${safeDevName}" class="dev-avatar" onerror="this.style.display='none'">
+            <span class="dev-name">${safeDevName}</span>
+          </a>
         </div>
       </div>
     </div>
@@ -826,7 +984,7 @@ function getHTML(): string {
     </div>
   </div>
 
-  <script>
+  <script nonce="${nonce}">
     "use strict";
     var allData = [];
     var currentFilter = "all";
@@ -839,19 +997,6 @@ function getHTML(): string {
       div.textContent = str;
       return div.innerHTML;
     }
-
-    function updateClock() {
-      try {
-        var now = new Date();
-        var mmTime = now.toLocaleTimeString("en-US", {
-          timeZone: "Asia/Yangon",
-          hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: true
-        });
-        document.getElementById("clock").textContent = mmTime;
-      } catch(e) {}
-    }
-    updateClock();
-    setInterval(updateClock, 1000);
 
     document.getElementById("tabs").addEventListener("click", function(e) {
       var btn = e.target.closest(".tab-btn");
@@ -1078,7 +1223,10 @@ function getHTML(): string {
       var overlay = document.createElement("div");
       overlay.id = "player-error-overlay";
       overlay.className = "player-error";
-      overlay.innerHTML = '<div>' + escapeHtml(message) + '</div>';
+
+      var msgDiv = document.createElement("div");
+      msgDiv.textContent = message;
+      overlay.appendChild(msgDiv);
 
       if (currentStreamUrl) {
         var retryBtn = document.createElement("button");
@@ -1219,16 +1367,25 @@ async function fetchServerURL(roomNum: any) {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 8000);
 
-    const res = await fetch(`${ROOM_API_BASE}/room/${roomStr}/detail.json`, {
+    const res = await fetch(`${ROOM_API_BASE}/room/${encodeURIComponent(roomStr)}/detail.json`, {
       headers: { "User-Agent": API_USER_AGENT, Referer: API_REFERER },
       signal: controller.signal,
     });
     clearTimeout(timeout);
 
     const txt = await res.text();
-    const m = txt.match(/detail\((.*)\)/);
+
+    // Limit response size to prevent abuse
+    if (txt.length > 512 * 1024) return { m3u8: null, hdM3u8: null };
+
+    const m = txt.match(/detail\((.*)\)/s);
     if (m) {
-      const js = JSON.parse(m[1]);
+      let js: any;
+      try {
+        js = JSON.parse(m[1]);
+      } catch {
+        return { m3u8: null, hdM3u8: null };
+      }
       if (js.code === 200 && js.data && js.data.stream) {
         const m3u8 = sanitizeUrl(js.data.stream.m3u8);
         const hdM3u8 = sanitizeUrl(js.data.stream.hdM3u8);
@@ -1255,19 +1412,34 @@ async function fetchMatches(date: string) {
     clearTimeout(timeout);
 
     const txt = await res.text();
-    const m = txt.match(/matches_\d+\((.*)\)/);
+
+    // Limit response size
+    if (txt.length > 5 * 1024 * 1024) return [];
+
+    const m = txt.match(/matches_\d+\((.*)\)/s);
     if (!m) return [];
 
-    const js = JSON.parse(m[1]);
+    let js: any;
+    try {
+      js = JSON.parse(m[1]);
+    } catch {
+      return [];
+    }
     if (js.code !== 200) return [];
 
     const now = Date.now();
     const results = [];
 
-    for (const it of js.data) {
+    // Limit to reasonable number of matches to prevent DoS
+    const matchData = Array.isArray(js.data) ? js.data.slice(0, 500) : [];
+
+    for (const it of matchData) {
       const mt = it.matchTime;
 
       if (!mt || typeof mt !== "number") continue;
+
+      // Sanity check: match time should be within reasonable range (±7 days)
+      if (Math.abs(now - mt) > 7 * 24 * 60 * 60 * 1000) continue;
 
       let status: string;
       if (now >= mt && now <= mt + 3 * 60 * 60 * 1000) status = "live";
@@ -1276,7 +1448,7 @@ async function fetchMatches(date: string) {
 
       const servers: any[] = [];
       if (status === "live" && it.anchors) {
-        const anchorSlice = it.anchors.slice(0, 3);
+        const anchorSlice = Array.isArray(it.anchors) ? it.anchors.slice(0, 3) : [];
         for (const a of anchorSlice) {
           const room = a.anchor?.roomNum;
           if (!room) continue;
@@ -1310,7 +1482,7 @@ async function fetchMatches(date: string) {
       if (it.homeScore !== undefined && it.homeScore !== null) {
         const hs = String(it.homeScore).replace(/[^0-9]/g, "").slice(0, 3);
         const as = String(it.awayScore).replace(/[^0-9]/g, "").slice(0, 3);
-        matchScore = `${hs} - ${as}`;
+        matchScore = hs + " - " + as;
       }
 
       // ---- Compute match_day label ----
