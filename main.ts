@@ -119,8 +119,8 @@ function securityHeaders(): Record<string, string> {
       "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; " +
       "font-src https://fonts.gstatic.com; " +
       "img-src 'self' https: data:; " +
-      "media-src 'self' https:; " +
-      "connect-src 'self';",
+      "media-src 'self' https: blob:; " +
+      "connect-src 'self' https: blob:;",
     "Strict-Transport-Security": "max-age=31536000; includeSubDomains",
   };
 }
@@ -130,21 +130,105 @@ function sanitizeUrl(url: string | null | undefined): string | null {
   if (!url || typeof url !== "string") return null;
   const trimmed = url.trim();
   if (/^https?:\/\//i.test(trimmed)) {
-    // Remove any characters that shouldn't be in a URL
     return trimmed.replace(/[<>"'`\s]/g, "");
   }
   return null;
 }
 
-// ====== SECURITY: Sanitize plain text (strip anything that isn't text) ======
+// ====== SECURITY: Sanitize plain text ======
 function sanitizeText(text: string | null | undefined, maxLen: number): string {
   if (!text || typeof text !== "string") return "";
-  // Remove any HTML tags and control characters
   return text
     .replace(/<[^>]*>/g, "")
     .replace(/[\x00-\x1f\x7f]/g, "")
     .trim()
     .slice(0, maxLen);
+}
+
+// ====== Stream Proxy Route ======
+async function handleStreamProxy(req: Request, url: URL): Promise<Response> {
+  const streamUrl = url.searchParams.get("url");
+  if (!streamUrl) {
+    return new Response("Missing url parameter", { status: 400, headers: securityHeaders() });
+  }
+
+  // Validate URL
+  if (!/^https?:\/\//i.test(streamUrl)) {
+    return new Response("Invalid URL", { status: 400, headers: securityHeaders() });
+  }
+
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 15000);
+
+    const proxyRes = await fetch(streamUrl, {
+      headers: {
+        "User-Agent": API_USER_AGENT,
+        Referer: API_REFERER,
+      },
+      signal: controller.signal,
+    });
+    clearTimeout(timeout);
+
+    if (!proxyRes.ok) {
+      return new Response("Stream unavailable", { status: 502, headers: securityHeaders() });
+    }
+
+    const contentType = proxyRes.headers.get("content-type") || "";
+    const body = proxyRes.body;
+
+    // For m3u8 playlists, rewrite internal URLs to also go through proxy
+    if (streamUrl.endsWith(".m3u8") || contentType.includes("mpegurl") || contentType.includes("m3u8")) {
+      const text = await proxyRes.text();
+      // Get base URL for resolving relative paths
+      const baseUrl = streamUrl.substring(0, streamUrl.lastIndexOf("/") + 1);
+      
+      const rewritten = text.split("\n").map((line: string) => {
+        const trimmed = line.trim();
+        if (trimmed && !trimmed.startsWith("#")) {
+          // This is a URL line (segment or sub-playlist)
+          let absoluteUrl: string;
+          if (/^https?:\/\//i.test(trimmed)) {
+            absoluteUrl = trimmed;
+          } else {
+            absoluteUrl = baseUrl + trimmed;
+          }
+          return "/api/stream-proxy?url=" + encodeURIComponent(absoluteUrl);
+        }
+        return line;
+      }).join("\n");
+
+      return new Response(rewritten, {
+        status: 200,
+        headers: {
+          "Content-Type": "application/vnd.apple.mpegurl",
+          "Access-Control-Allow-Origin": "*",
+          "Cache-Control": "no-cache",
+          ...securityHeaders(),
+        },
+      });
+    }
+
+    // For .ts segments, stream them through
+    const resHeaders: Record<string, string> = {
+      "Access-Control-Allow-Origin": "*",
+      "Cache-Control": "public, max-age=10",
+      ...securityHeaders(),
+    };
+    if (contentType) {
+      resHeaders["Content-Type"] = contentType;
+    } else if (streamUrl.endsWith(".ts")) {
+      resHeaders["Content-Type"] = "video/mp2t";
+    }
+
+    return new Response(body, {
+      status: 200,
+      headers: resHeaders,
+    });
+  } catch (e: any) {
+    console.warn("Stream proxy error:", e.message);
+    return new Response("Stream error", { status: 502, headers: securityHeaders() });
+  }
 }
 
 serve(async (req) => {
@@ -193,7 +277,7 @@ serve(async (req) => {
     });
   }
 
-  // --- 1. API ROUTE (Backend) ---
+  // --- 1. API ROUTE: Matches ---
   if (url.pathname === "/api/matches") {
     try {
       const getVNDate = (offset: number) => {
@@ -248,7 +332,12 @@ serve(async (req) => {
     }
   }
 
-  // --- 2. FRONTEND UI (HTML) ---
+  // --- 2. API ROUTE: Stream Proxy ---
+  if (url.pathname === "/api/stream-proxy") {
+    return await handleStreamProxy(req, url);
+  }
+
+  // --- 3. FRONTEND UI (HTML) ---
   if (url.pathname === "/") {
     return new Response(getHTML(), {
       headers: {
@@ -261,7 +350,7 @@ serve(async (req) => {
   return new Response("Not Found", { status: 404, headers: securityHeaders() });
 });
 
-// ====== FRONTEND HTML — LIGHT BACKGROUND PREMIUM UI ======
+// ====== FRONTEND HTML ======
 function getHTML(): string {
   return `<!DOCTYPE html>
 <html lang="my">
@@ -289,7 +378,6 @@ function getHTML(): string {
       z-index: 1;
     }
 
-    /* ===== HEADER ===== */
     .premium-header {
       background: linear-gradient(135deg, rgba(255,255,255,0.95) 0%, rgba(241,245,249,0.98) 100%);
       border-bottom: 1px solid rgba(0,0,0,0.06);
@@ -315,7 +403,6 @@ function getHTML(): string {
       text-transform: uppercase;
     }
 
-    /* ===== LIVE DOT ===== */
     .live-dot {
       width: 8px; height: 8px;
       background: #ef4444;
@@ -329,7 +416,6 @@ function getHTML(): string {
       50% { opacity: 0.5; transform: scale(0.7); }
     }
 
-    /* ===== CARDS ===== */
     .card {
       background: rgba(255,255,255,0.85);
       border: 1px solid rgba(0,0,0,0.06);
@@ -355,7 +441,6 @@ function getHTML(): string {
       box-shadow: 0 0 30px rgba(239,68,68,0.08);
     }
 
-    /* ===== TEAM LOGOS ===== */
     .team-logo {
       width: 48px; height: 48px;
       border-radius: 50%;
@@ -377,7 +462,6 @@ function getHTML(): string {
       border: 2px solid rgba(0,0,0,0.06);
     }
 
-    /* ===== BUTTONS ===== */
     .btn-hd {
       background: linear-gradient(135deg, #ef4444, #dc2626);
       box-shadow: 0 4px 15px rgba(239,68,68,0.25);
@@ -414,7 +498,6 @@ function getHTML(): string {
     .btn-sd:hover { box-shadow: 0 6px 25px rgba(99,102,241,0.4); transform: translateY(-1px); }
     .btn-sd:active { transform: translateY(0); }
 
-    /* ===== SCORE BOX ===== */
     .score-box {
       background: rgba(15,23,42,0.9);
       border: 1px solid rgba(255,255,255,0.1);
@@ -423,7 +506,6 @@ function getHTML(): string {
       min-width: 80px;
     }
 
-    /* ===== LEAGUE BADGE ===== */
     .league-badge {
       background: linear-gradient(135deg, rgba(217,119,6,0.08), rgba(180,83,9,0.05));
       border: 1px solid rgba(217,119,6,0.15);
@@ -432,7 +514,6 @@ function getHTML(): string {
       font-weight: 600;
     }
 
-    /* ===== TABS ===== */
     .tab-btn {
       padding: 10px 22px;
       border-radius: 24px;
@@ -460,7 +541,6 @@ function getHTML(): string {
       border-color: rgba(0,0,0,0.12);
     }
 
-    /* ===== STAT PILLS ===== */
     .stat-pill {
       background: rgba(255,255,255,0.7);
       border: 1px solid rgba(0,0,0,0.06);
@@ -478,7 +558,6 @@ function getHTML(): string {
       display: inline-block;
     }
 
-    /* ===== LOADING ===== */
     .loading-spinner {
       width: 44px; height: 44px;
       border: 3px solid rgba(0,0,0,0.06);
@@ -489,7 +568,6 @@ function getHTML(): string {
     }
     @keyframes spin { to { transform: rotate(360deg); } }
 
-    /* ===== PLAYER ===== */
     .player-wrapper {
       border-radius: 20px;
       overflow: hidden;
@@ -506,7 +584,6 @@ function getHTML(): string {
       background: linear-gradient(135deg, #dc2626, #991b1b);
     }
 
-    /* ===== STATUS BADGES ===== */
     .status-live {
       background: rgba(239,68,68,0.1);
       border: 1px solid rgba(239,68,68,0.2);
@@ -538,13 +615,11 @@ function getHTML(): string {
       font-weight: 600;
     }
 
-    /* ===== SCROLLBAR ===== */
     ::-webkit-scrollbar { width: 3px; height: 3px; }
     ::-webkit-scrollbar-track { background: transparent; }
     ::-webkit-scrollbar-thumb { background: rgba(0,0,0,0.1); border-radius: 4px; }
     ::-webkit-scrollbar-thumb:hover { background: rgba(0,0,0,0.2); }
 
-    /* ===== PAGE LOAD ANIMATION ===== */
     @keyframes fadeUp {
       from { opacity: 0; transform: translateY(12px); }
       to { opacity: 1; transform: translateY(0); }
@@ -554,7 +629,6 @@ function getHTML(): string {
     .fade-up-delay-2 { animation-delay: 0.2s; opacity: 0; }
     .fade-up-delay-3 { animation-delay: 0.3s; opacity: 0; }
 
-    /* ===== NO MATCHES ===== */
     .empty-state {
       text-align: center;
       padding: 60px 20px;
@@ -565,8 +639,45 @@ function getHTML(): string {
       opacity: 0.5;
     }
 
-    /* ===== FOOTER SPACING ===== */
     .bottom-safe { height: 100px; }
+
+    /* Player error overlay */
+    .player-error {
+      position: absolute;
+      top: 0; left: 0; right: 0; bottom: 0;
+      background: rgba(0,0,0,0.85);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      color: #fff;
+      font-size: 14px;
+      z-index: 10;
+    }
+    .player-error-btn {
+      margin-top: 12px;
+      background: #d97706;
+      color: #fff;
+      border: none;
+      padding: 8px 24px;
+      border-radius: 20px;
+      font-weight: 700;
+      cursor: pointer;
+    }
+
+    /* Loading overlay for player */
+    .player-loading {
+      position: absolute;
+      top: 0; left: 0; right: 0; bottom: 0;
+      background: rgba(0,0,0,0.6);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      z-index: 5;
+    }
+    .player-loading .loading-spinner {
+      border-top-color: #facc15;
+    }
   </style>
 </head>
 <body>
@@ -616,8 +727,11 @@ function getHTML(): string {
 
       <!-- Video Player -->
       <div id="player-container" class="hidden sticky top-[68px] z-50 mb-5 player-wrapper">
-        <div class="bg-black relative">
+        <div class="bg-black relative" id="player-inner">
           <video id="video" controls class="w-full aspect-video" autoplay playsinline></video>
+          <div id="player-loading" class="player-loading hidden">
+            <div class="loading-spinner"></div>
+          </div>
         </div>
         <button id="close-player-btn" class="close-btn w-full text-xs font-bold py-3.5 flex items-center justify-center gap-2">
           ✕ Close Player
@@ -639,11 +753,11 @@ function getHTML(): string {
 
   <script>
     "use strict";
-    let allData = [];
-    let currentFilter = "all";
-    let currentHls = null;
+    var allData = [];
+    var currentFilter = "all";
+    var currentHls = null;
+    var currentStreamUrl = null;
 
-    // Safely escape HTML to prevent XSS
     function escapeHtml(str) {
       if (typeof str !== "string") return "";
       var div = document.createElement("div");
@@ -651,7 +765,6 @@ function getHTML(): string {
       return div.innerHTML;
     }
 
-    // Live clock
     function updateClock() {
       try {
         var now = new Date();
@@ -660,12 +773,11 @@ function getHTML(): string {
           hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: true
         });
         document.getElementById("clock").textContent = mmTime;
-      } catch(e) { /* ignore clock errors */ }
+      } catch(e) {}
     }
     updateClock();
     setInterval(updateClock, 1000);
 
-    // Tab click handler using event delegation (fixes Firefox event issue)
     document.getElementById("tabs").addEventListener("click", function(e) {
       var btn = e.target.closest(".tab-btn");
       if (!btn) return;
@@ -677,7 +789,6 @@ function getHTML(): string {
       renderMatches();
     });
 
-    // Close player handler
     document.getElementById("close-player-btn").addEventListener("click", function() {
       closePlayer();
     });
@@ -742,19 +853,16 @@ function getHTML(): string {
         return;
       }
 
-      // Clear existing content
       list.innerHTML = "";
 
       filtered.forEach(function(m, idx) {
         var isLive = m.match_status === "live";
         var isFinished = m.match_status === "finished";
 
-        // Create card
         var card = document.createElement("div");
         card.className = isLive ? "card card-live p-5" : "card p-5";
         card.style.animation = "fadeUp 0.4s ease-out " + (idx * 0.05) + "s both";
 
-        // Header row: league + status
         var headerRow = document.createElement("div");
         headerRow.className = "flex justify-between items-center mb-4";
 
@@ -777,11 +885,9 @@ function getHTML(): string {
         headerRow.appendChild(leagueBadge);
         headerRow.appendChild(statusBadge);
 
-        // Teams row
         var teamsRow = document.createElement("div");
         teamsRow.className = "flex items-center justify-between";
 
-        // Home team
         var homeDiv = document.createElement("div");
         homeDiv.className = "flex flex-col items-center w-[30%] gap-2";
         homeDiv.appendChild(createLogoElement(m.home_team_logo));
@@ -790,7 +896,6 @@ function getHTML(): string {
         homeName.textContent = m.home_team_name || "Home";
         homeDiv.appendChild(homeName);
 
-        // Score
         var scoreDiv = document.createElement("div");
         scoreDiv.className = "w-[30%] flex justify-center";
         var scoreBox = document.createElement("div");
@@ -809,7 +914,6 @@ function getHTML(): string {
         }
         scoreDiv.appendChild(scoreBox);
 
-        // Away team
         var awayDiv = document.createElement("div");
         awayDiv.className = "flex flex-col items-center w-[30%] gap-2";
         awayDiv.appendChild(createLogoElement(m.away_team_logo));
@@ -822,9 +926,8 @@ function getHTML(): string {
         teamsRow.appendChild(scoreDiv);
         teamsRow.appendChild(awayDiv);
 
-        // Buttons row
         var btnsRow = document.createElement("div");
-        btnsRow.className = "text-center mt-4 pt-3 border-t border-black/[0.04] flex gap-2.5 justify-center";
+        btnsRow.className = "text-center mt-4 pt-3 border-t border-black/[0.04] flex gap-2.5 justify-center flex-wrap";
 
         if (m.servers && m.servers.length > 0) {
           m.servers.forEach(function(s) {
@@ -832,7 +935,6 @@ function getHTML(): string {
             var isHD = s.name && s.name.indexOf("HD") !== -1;
             btn.className = (isHD ? "btn-hd" : "btn-sd") + " text-white text-[11px] px-5 py-2 rounded-full font-bold transition-all";
             btn.textContent = isHD ? "▶ HD" : "▶ SD";
-            // Use data attribute for stream URL instead of inline onclick
             btn.setAttribute("data-stream-url", s.stream_url);
             btn.addEventListener("click", function() {
               play(this.getAttribute("data-stream-url"));
@@ -862,12 +964,57 @@ function getHTML(): string {
       });
     }
 
-    function play(url) {
-      if (!url || typeof url !== "string") return;
-      // Basic URL validation - only allow http(s)
-      if (!/^https?:\\/\\//i.test(url)) return;
+    function showPlayerLoading(show) {
+      var el = document.getElementById("player-loading");
+      if (show) {
+        el.classList.remove("hidden");
+      } else {
+        el.classList.add("hidden");
+      }
+    }
+
+    function showPlayerError(message) {
+      // Remove existing error overlay if any
+      var existing = document.getElementById("player-error-overlay");
+      if (existing) existing.remove();
+
+      var overlay = document.createElement("div");
+      overlay.id = "player-error-overlay";
+      overlay.className = "player-error";
+      overlay.innerHTML = '<div>' + escapeHtml(message) + '</div>';
+
+      if (currentStreamUrl) {
+        var retryBtn = document.createElement("button");
+        retryBtn.className = "player-error-btn";
+        retryBtn.textContent = "Retry";
+        retryBtn.addEventListener("click", function() {
+          overlay.remove();
+          play(currentStreamUrl);
+        });
+        overlay.appendChild(retryBtn);
+      }
+
+      document.getElementById("player-inner").appendChild(overlay);
+    }
+
+    function clearPlayerError() {
+      var existing = document.getElementById("player-error-overlay");
+      if (existing) existing.remove();
+    }
+
+    function play(originalUrl) {
+      if (!originalUrl || typeof originalUrl !== "string") return;
+      if (!/^https?:\\/\\//i.test(originalUrl)) return;
+
+      currentStreamUrl = originalUrl;
+
+      // Use proxy to avoid CORS / CSP issues
+      var proxyUrl = "/api/stream-proxy?url=" + encodeURIComponent(originalUrl);
 
       document.getElementById("player-container").classList.remove("hidden");
+      clearPlayerError();
+      showPlayerLoading(true);
+
       var vid = document.getElementById("video");
 
       if (currentHls) {
@@ -875,31 +1022,76 @@ function getHTML(): string {
         currentHls = null;
       }
 
+      vid.removeAttribute("src");
+      vid.load();
+
       if (typeof Hls !== "undefined" && Hls.isSupported()) {
         var hls = new Hls({
           enableWorker: true,
           lowLatencyMode: true,
           maxBufferLength: 30,
           maxMaxBufferLength: 60,
+          xhrSetup: function(xhr, url) {
+            // If it's already a proxy URL, use as-is; otherwise proxy it
+            if (url.indexOf("/api/stream-proxy") === -1 && /^https?:\\/\\//i.test(url)) {
+              xhr.open("GET", "/api/stream-proxy?url=" + encodeURIComponent(url), true);
+            }
+          }
         });
         currentHls = hls;
-        hls.loadSource(url);
+        hls.loadSource(proxyUrl);
         hls.attachMedia(vid);
-        hls.on(Hls.Events.MANIFEST_PARSED, function() { vid.play(); });
+
+        hls.on(Hls.Events.MANIFEST_PARSED, function() {
+          showPlayerLoading(false);
+          vid.play().catch(function() {});
+        });
+
+        hls.on(Hls.Events.FRAG_LOADED, function() {
+          showPlayerLoading(false);
+        });
+
         hls.on(Hls.Events.ERROR, function(event, data) {
           if (data.fatal) {
+            showPlayerLoading(false);
             if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+              // Try recovery once
+              console.warn("HLS network error, attempting recovery...");
               hls.startLoad();
+              setTimeout(function() {
+                // If still not playing after 10 seconds, show error
+                if (vid.paused && vid.readyState < 3) {
+                  showPlayerError("Stream connection failed. Please try another server.");
+                }
+              }, 10000);
+            } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+              console.warn("HLS media error, attempting recovery...");
+              hls.recoverMediaError();
             } else {
+              showPlayerError("Stream unavailable. Please try another server.");
               hls.destroy();
               currentHls = null;
             }
           }
         });
       } else if (vid.canPlayType("application/vnd.apple.mpegurl")) {
-        vid.src = url;
-        vid.play();
+        // Native HLS (Safari / iOS)
+        vid.src = proxyUrl;
+        vid.addEventListener("loadeddata", function onLoaded() {
+          showPlayerLoading(false);
+          vid.removeEventListener("loadeddata", onLoaded);
+        });
+        vid.addEventListener("error", function onError() {
+          showPlayerLoading(false);
+          showPlayerError("Stream unavailable. Please try another server.");
+          vid.removeEventListener("error", onError);
+        });
+        vid.play().catch(function() {});
+      } else {
+        showPlayerLoading(false);
+        showPlayerError("Your browser does not support HLS streaming.");
       }
+
       window.scrollTo({ top: 0, behavior: "smooth" });
     }
 
@@ -912,12 +1104,13 @@ function getHTML(): string {
         currentHls.destroy();
         currentHls = null;
       }
+      currentStreamUrl = null;
+      clearPlayerError();
+      showPlayerLoading(false);
       document.getElementById("player-container").classList.add("hidden");
     }
 
-    // Initial load
     load();
-    // Auto-refresh every 60 seconds
     setInterval(load, 60000);
   <\/script>
 </body>
@@ -928,7 +1121,6 @@ function getHTML(): string {
 
 async function fetchServerURL(roomNum: any) {
   try {
-    // Validate roomNum - only allow alphanumeric
     const roomStr = String(roomNum);
     if (!/^[a-zA-Z0-9_-]+$/.test(roomStr)) return { m3u8: null, hdM3u8: null };
 
@@ -958,7 +1150,6 @@ async function fetchServerURL(roomNum: any) {
 }
 
 async function fetchMatches(date: string) {
-  // Validate date format (YYYYMMDD)
   if (!/^\d{8}$/.test(date)) return [];
 
   try {
@@ -1003,7 +1194,6 @@ async function fetchMatches(date: string) {
         }
       }
 
-      // Sanitize logo URLs
       const homeLogo = sanitizeUrl(
         it.homeLogo || it.hostLogo || it.homeIcon || it.hostIcon
       );
@@ -1011,7 +1201,6 @@ async function fetchMatches(date: string) {
         it.awayLogo || it.guestLogo || it.awayIcon || it.guestIcon
       );
 
-      // Sanitize text fields
       const homeTeamName = sanitizeText(
         it.homeName || it.hostName || "Home",
         50
@@ -1025,7 +1214,6 @@ async function fetchMatches(date: string) {
         80
       );
 
-      // Validate score values
       let matchScore: string | null = null;
       if (it.homeScore !== undefined && it.homeScore !== null) {
         const hs = String(it.homeScore).replace(/[^0-9]/g, "").slice(0, 3);
