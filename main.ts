@@ -394,6 +394,12 @@ function getHTML(): string {
       box-shadow: 0 0 30px rgba(239,68,68,0.08);
     }
 
+    /* Active card highlight when watching */
+    .card-watching {
+      border-color: rgba(217,119,6,0.5) !important;
+      box-shadow: 0 0 0 2px rgba(217,119,6,0.15), 0 8px 32px rgba(217,119,6,0.12) !important;
+    }
+
     .team-logo {
       width: 48px; height: 48px;
       border-radius: 50%;
@@ -527,6 +533,47 @@ function getHTML(): string {
       border: 2px solid rgba(217,119,6,0.2);
       box-shadow: 0 20px 60px rgba(0,0,0,0.15);
     }
+
+    /* Now-watching banner inside player */
+    .now-watching-bar {
+      background: linear-gradient(135deg, #0f172a, #1e293b);
+      padding: 10px 16px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      border-bottom: 1px solid rgba(255,255,255,0.06);
+    }
+    .now-watching-bar .nw-dot {
+      width: 8px; height: 8px;
+      background: #ef4444;
+      border-radius: 50%;
+      animation: pulse-dot 1s ease-in-out infinite;
+      flex-shrink: 0;
+    }
+    .now-watching-bar .nw-label {
+      font-size: 10px;
+      font-weight: 700;
+      color: #facc15;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      flex-shrink: 0;
+    }
+    .now-watching-bar .nw-match {
+      font-size: 12px;
+      font-weight: 600;
+      color: #e2e8f0;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .now-watching-bar .nw-league {
+      font-size: 10px;
+      color: #94a3b8;
+      margin-left: auto;
+      white-space: nowrap;
+      flex-shrink: 0;
+    }
+
     .close-btn {
       background: linear-gradient(135deg, #1e293b, #0f172a);
       border-top: 1px solid rgba(255,255,255,0.06);
@@ -597,17 +644,20 @@ function getHTML(): string {
     .player-error {
       position: absolute;
       top: 0; left: 0; right: 0; bottom: 0;
-      background: rgba(0,0,0,0.85);
+      background: rgba(0,0,0,0.9);
       display: flex;
       flex-direction: column;
       align-items: center;
       justify-content: center;
       color: #fff;
-      font-size: 14px;
+      font-size: 13px;
       z-index: 10;
+      padding: 20px;
+      text-align: center;
+      line-height: 1.7;
     }
     .player-error-btn {
-      margin-top: 12px;
+      margin-top: 14px;
       background: #d97706;
       color: #fff;
       border: none;
@@ -615,6 +665,13 @@ function getHTML(): string {
       border-radius: 20px;
       font-weight: 700;
       cursor: pointer;
+    }
+    .player-error-tips {
+      margin-top: 10px;
+      font-size: 11px;
+      color: #94a3b8;
+      max-width: 300px;
+      line-height: 1.8;
     }
 
     .player-loading {
@@ -718,6 +775,13 @@ function getHTML(): string {
 
       <!-- Video Player -->
       <div id="player-container" class="hidden sticky top-[68px] z-50 mb-5 player-wrapper">
+        <!-- Now Watching Banner -->
+        <div id="now-watching-bar" class="now-watching-bar hidden">
+          <span class="nw-dot"></span>
+          <span class="nw-label">Watching</span>
+          <span class="nw-match" id="nw-match-text">—</span>
+          <span class="nw-league" id="nw-league-text"></span>
+        </div>
         <div class="bg-black relative" id="player-inner">
           <video id="video" controls class="w-full aspect-video" autoplay playsinline></video>
           <div id="player-loading" class="player-loading hidden">
@@ -748,6 +812,10 @@ function getHTML(): string {
     var currentFilter = "all";
     var currentHls = null;
     var currentStreamUrl = null;
+    var currentWatchingMatch = null; // Track which match user is watching
+
+    // ====== Logo cache to speed up repeated renders ======
+    var logoCache = {};
 
     function escapeHtml(str) {
       if (typeof str !== "string") return "";
@@ -779,6 +847,8 @@ function getHTML(): string {
         if (data.error) throw new Error(data.error);
         allData = data;
         document.getElementById("loading").style.display = "none";
+        // Preload logo images into cache
+        preloadLogos(data);
         updateStats();
         renderMatches();
       } catch (e) {
@@ -787,6 +857,19 @@ function getHTML(): string {
           '<div class="text-red-500 text-sm font-medium">' + escapeHtml(e.message) + '</div>' +
           '<div class="text-slate-400 text-xs mt-2">Pull to refresh or try again later</div></div>';
       }
+    }
+
+    function preloadLogos(matches) {
+      matches.forEach(function(m) {
+        [m.home_team_logo, m.away_team_logo].forEach(function(url) {
+          if (url && !logoCache[url]) {
+            var img = new Image();
+            img.src = url;
+            img.onload = function() { logoCache[url] = "ok"; };
+            img.onerror = function() { logoCache[url] = "fail"; };
+          }
+        });
+      });
     }
 
     function updateStats() {
@@ -798,17 +881,29 @@ function getHTML(): string {
     }
 
     function createLogoElement(url) {
+      // If cached as failed, show fallback immediately
+      if (url && logoCache[url] === "fail") {
+        var fallback = document.createElement("div");
+        fallback.className = "team-logo-fallback";
+        fallback.textContent = "⚽";
+        return fallback;
+      }
       if (url) {
         var img = document.createElement("img");
         img.className = "team-logo";
-        img.loading = "lazy";
+        img.loading = "eager";
+        img.decoding = "async";
         img.alt = "";
         img.src = url;
         img.onerror = function() {
-          var fallback = document.createElement("div");
-          fallback.className = "team-logo-fallback";
-          fallback.textContent = "⚽";
-          img.replaceWith(fallback);
+          logoCache[url] = "fail";
+          var fb = document.createElement("div");
+          fb.className = "team-logo-fallback";
+          fb.textContent = "⚽";
+          img.replaceWith(fb);
+        };
+        img.onload = function() {
+          logoCache[url] = "ok";
         };
         return img;
       }
@@ -823,6 +918,38 @@ function getHTML(): string {
       if (day === "Tomorrow") return "day-tomorrow";
       if (day === "Yesterday") return "day-yesterday";
       return "day-other";
+    }
+
+    function getMatchUniqueKey(m) {
+      return (m.home_team_name || "") + " vs " + (m.away_team_name || "") + " | " + (m.league_name || "");
+    }
+
+    function updateNowWatchingBar() {
+      var bar = document.getElementById("now-watching-bar");
+      if (currentWatchingMatch) {
+        document.getElementById("nw-match-text").textContent =
+          (currentWatchingMatch.home_team_name || "Home") + "  vs  " + (currentWatchingMatch.away_team_name || "Away");
+        document.getElementById("nw-league-text").textContent = currentWatchingMatch.league_name || "";
+        bar.classList.remove("hidden");
+      } else {
+        bar.classList.add("hidden");
+      }
+    }
+
+    function highlightWatchingCard() {
+      // Remove previous highlights
+      document.querySelectorAll(".card-watching").forEach(function(el) {
+        el.classList.remove("card-watching");
+      });
+      if (currentWatchingMatch) {
+        var key = getMatchUniqueKey(currentWatchingMatch);
+        var cards = document.querySelectorAll("[data-match-key]");
+        cards.forEach(function(card) {
+          if (card.getAttribute("data-match-key") === key) {
+            card.classList.add("card-watching");
+          }
+        });
+      }
     }
 
     function renderMatches() {
@@ -845,6 +972,7 @@ function getHTML(): string {
       filtered.forEach(function(m, idx) {
         var isLive = m.match_status === "live";
         var isFinished = m.match_status === "finished";
+        var matchKey = getMatchUniqueKey(m);
 
         // Day separator
         var matchDay = m.match_day || "Today";
@@ -860,7 +988,13 @@ function getHTML(): string {
 
         var card = document.createElement("div");
         card.className = isLive ? "card card-live p-5" : "card p-5";
+        card.setAttribute("data-match-key", matchKey);
         card.style.animation = "fadeUp 0.4s ease-out " + (idx * 0.05) + "s both";
+
+        // Highlight if currently watching this match
+        if (currentWatchingMatch && getMatchUniqueKey(currentWatchingMatch) === matchKey) {
+          card.classList.add("card-watching");
+        }
 
         var headerRow = document.createElement("div");
         headerRow.className = "flex justify-between items-center mb-4";
@@ -938,7 +1072,11 @@ function getHTML(): string {
             btn.textContent = isHD ? "▶ HD" : "▶ SD";
             btn.setAttribute("data-stream-url", s.stream_url);
             btn.addEventListener("click", function() {
+              // Set the match info for now-watching
+              currentWatchingMatch = m;
               play(this.getAttribute("data-stream-url"));
+              updateNowWatchingBar();
+              highlightWatchingCard();
             });
             btnsRow.appendChild(btn);
           });
@@ -974,6 +1112,18 @@ function getHTML(): string {
       }
     }
 
+    function getStreamErrorHTML(message) {
+      return '<div style="font-size:14px;font-weight:600;margin-bottom:6px;">' + escapeHtml(message) + '</div>' +
+        '<div class="player-error-tips">' +
+          '⚠ အကြောင်းအရင်းများ -<br>' +
+          '① သတ်မှတ်ထားသော ထုတ်လွှင့်ချိန် မရောက်သေးတာ ဖြစ်နိုင်ပါသည်။<br>' +
+          '② မူရင်း Stream Link ပျက်နေတာ ဖြစ်နိုင်ပါသည်။<br>' +
+          '③ သင့်နိုင်ငံ/ဒေသမှ ပိတ်ထားတာ ဖြစ်နိုင်ပါသည်။<br><br>' +
+          '💡 VPN ဖွင့်ပြီး ပြန်ကြိုးစားကြည့်ပါ။<br>' +
+          '💡 အခြား Server (HD/SD) ပြောင်းကြည့်ပါ။' +
+        '</div>';
+    }
+
     function showPlayerError(message) {
       var existing = document.getElementById("player-error-overlay");
       if (existing) existing.remove();
@@ -981,12 +1131,12 @@ function getHTML(): string {
       var overlay = document.createElement("div");
       overlay.id = "player-error-overlay";
       overlay.className = "player-error";
-      overlay.innerHTML = '<div>' + escapeHtml(message) + '</div>';
+      overlay.innerHTML = getStreamErrorHTML(message);
 
       if (currentStreamUrl) {
         var retryBtn = document.createElement("button");
         retryBtn.className = "player-error-btn";
-        retryBtn.textContent = "Retry";
+        retryBtn.textContent = "ပြန်ကြိုးစားမည်";
         retryBtn.addEventListener("click", function() {
           overlay.remove();
           play(currentStreamUrl);
@@ -1011,6 +1161,7 @@ function getHTML(): string {
       document.getElementById("player-container").classList.remove("hidden");
       clearPlayerError();
       showPlayerLoading(true);
+      updateNowWatchingBar();
 
       var vid = document.getElementById("video");
 
@@ -1050,14 +1201,14 @@ function getHTML(): string {
               hls.startLoad();
               setTimeout(function() {
                 if (vid.paused && vid.readyState < 3) {
-                  showPlayerError("Stream connection failed. Please try another server.");
+                  showPlayerError("Stream ချိတ်ဆက်မှု မအောင်မြင်ပါ။");
                 }
               }, 10000);
             } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
               console.warn("HLS media error, attempting recovery...");
               hls.recoverMediaError();
             } else {
-              showPlayerError("Stream unavailable. Please try another server.");
+              showPlayerError("Stream ကြည့်ရှု၍ မရနိုင်သေးပါ။");
               hls.destroy();
               currentHls = null;
             }
@@ -1071,13 +1222,13 @@ function getHTML(): string {
         });
         vid.addEventListener("error", function onError() {
           showPlayerLoading(false);
-          showPlayerError("Stream unavailable. Please try another server.");
+          showPlayerError("Stream ကြည့်ရှု၍ မရနိုင်သေးပါ။");
           vid.removeEventListener("error", onError);
         });
         vid.play().catch(function() {});
       } else {
         showPlayerLoading(false);
-        showPlayerError("Your browser does not support HLS streaming.");
+        showPlayerError("သင့် Browser သည် HLS streaming ကို support မလုပ်ပါ။");
       }
 
       window.scrollTo({ top: 0, behavior: "smooth" });
@@ -1093,9 +1244,12 @@ function getHTML(): string {
         currentHls = null;
       }
       currentStreamUrl = null;
+      currentWatchingMatch = null;
       clearPlayerError();
       showPlayerLoading(false);
       document.getElementById("player-container").classList.add("hidden");
+      updateNowWatchingBar();
+      highlightWatchingCard();
     }
 
     load();
@@ -1106,6 +1260,9 @@ function getHTML(): string {
 }
 
 // ====== BACKEND LOGIC ======
+
+// ====== Logo proxy cache to avoid repeated slow external fetches ======
+const logoProxyCache = new Map<string, { data: Uint8Array; contentType: string; expires: number }>();
 
 async function fetchServerURL(roomNum: any) {
   try {
@@ -1160,6 +1317,11 @@ async function fetchMatches(date: string) {
     const now = Date.now();
     const results = [];
 
+    // Collect all live match anchor room fetches in parallel
+    const roomFetchPromises: { index: number; promise: Promise<{ m3u8: string | null; hdM3u8: string | null }> }[] = [];
+
+    const prelimResults: any[] = [];
+
     for (const it of js.data) {
       const mt = it.matchTime;
 
@@ -1169,18 +1331,6 @@ async function fetchMatches(date: string) {
       if (now >= mt && now <= mt + 3 * 60 * 60 * 1000) status = "live";
       else if (now > mt + 3 * 60 * 60 * 1000) status = "finished";
       else status = "upcoming";
-
-      const servers: any[] = [];
-      if (status === "live" && it.anchors) {
-        const anchorSlice = it.anchors.slice(0, 3);
-        for (const a of anchorSlice) {
-          const room = a.anchor?.roomNum;
-          if (!room) continue;
-          const { m3u8, hdM3u8 } = await fetchServerURL(room);
-          if (m3u8) servers.push({ name: "Soco SD", stream_url: m3u8 });
-          if (hdM3u8) servers.push({ name: "Soco HD", stream_url: hdM3u8 });
-        }
-      }
 
       const homeLogo = sanitizeUrl(
         it.homeLogo || it.hostLogo || it.homeIcon || it.hostIcon
@@ -1253,7 +1403,8 @@ async function fetchMatches(date: string) {
         matchDay = matchDateStr;
       }
 
-      results.push({
+      const entryIndex = prelimResults.length;
+      prelimResults.push({
         match_time: new Date(mt).toLocaleTimeString("en-US", {
           timeZone: "Asia/Yangon",
           hour: "2-digit",
@@ -1268,10 +1419,39 @@ async function fetchMatches(date: string) {
         away_team_logo: awayLogo,
         league_name: leagueName,
         match_score: matchScore,
-        servers,
+        servers: [] as any[],
       });
+
+      // Queue room fetches in parallel for live matches
+      if (status === "live" && it.anchors) {
+        const anchorSlice = it.anchors.slice(0, 3);
+        for (const a of anchorSlice) {
+          const room = a.anchor?.roomNum;
+          if (!room) continue;
+          roomFetchPromises.push({
+            index: entryIndex,
+            promise: fetchServerURL(room),
+          });
+        }
+      }
     }
-    return results;
+
+    // Await all room fetches in parallel (big speed improvement)
+    const roomResults = await Promise.allSettled(
+      roomFetchPromises.map((r) => r.promise)
+    );
+
+    for (let i = 0; i < roomFetchPromises.length; i++) {
+      const result = roomResults[i];
+      if (result.status === "fulfilled") {
+        const { m3u8, hdM3u8 } = result.value;
+        const idx = roomFetchPromises[i].index;
+        if (m3u8) prelimResults[idx].servers.push({ name: "Soco SD", stream_url: m3u8 });
+        if (hdM3u8) prelimResults[idx].servers.push({ name: "Soco HD", stream_url: hdM3u8 });
+      }
+    }
+
+    return prelimResults;
   } catch (e) {
     console.warn(`matches ${date} error:`, e);
     return [];
