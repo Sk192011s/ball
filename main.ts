@@ -152,6 +152,80 @@ function sanitizeText(
     .slice(0, maxLen);
 }
 
+// ====== Logo Proxy Cache (in-memory, binary data) ======
+const logoProxyCache = new Map<
+  string,
+  { data: Uint8Array; contentType: string; expires: number }
+>();
+const LOGO_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+const LOGO_CACHE_MAX_SIZE = 500; // max cached logos
+
+// Clean up expired logo cache entries periodically
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, entry] of logoProxyCache) {
+    if (now > entry.expires) logoProxyCache.delete(key);
+  }
+}, 2 * 60_000);
+
+async function fetchLogoViaProxy(
+  logoUrl: string
+): Promise<{ data: Uint8Array; contentType: string } | null> {
+  // Check cache first
+  const cached = logoProxyCache.get(logoUrl);
+  if (cached && Date.now() < cached.expires) {
+    return { data: cached.data, contentType: cached.contentType };
+  }
+
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 8000);
+
+    const res = await fetch(logoUrl, {
+      headers: {
+        "User-Agent": API_USER_AGENT,
+        Referer: API_REFERER,
+        Accept: "image/*,*/*;q=0.8",
+      },
+      signal: controller.signal,
+    });
+    clearTimeout(timeout);
+
+    if (!res.ok) return null;
+
+    const contentType =
+      res.headers.get("content-type") || "image/png";
+    const arrayBuf = await res.arrayBuffer();
+    const data = new Uint8Array(arrayBuf);
+
+    // Don't cache excessively large images (> 2MB)
+    if (data.length > 2 * 1024 * 1024) return { data, contentType };
+
+    // Evict oldest entries if cache is too large
+    if (logoProxyCache.size >= LOGO_CACHE_MAX_SIZE) {
+      let oldestKey: string | null = null;
+      let oldestTime = Infinity;
+      for (const [key, entry] of logoProxyCache) {
+        if (entry.expires < oldestTime) {
+          oldestTime = entry.expires;
+          oldestKey = key;
+        }
+      }
+      if (oldestKey) logoProxyCache.delete(oldestKey);
+    }
+
+    logoProxyCache.set(logoUrl, {
+      data,
+      contentType,
+      expires: Date.now() + LOGO_CACHE_TTL,
+    });
+
+    return { data, contentType };
+  } catch (_e) {
+    return null;
+  }
+}
+
 serve(async (req) => {
   const url = new URL(req.url);
   const clientIP = getClientIP(req);
@@ -253,7 +327,50 @@ serve(async (req) => {
     }
   }
 
-  // --- 2. FRONTEND UI (HTML) ---
+  // --- 2. API ROUTE: Logo Proxy ---
+  if (url.pathname === "/api/logo-proxy") {
+    const logoUrl = url.searchParams.get("url");
+    const sanitized = sanitizeUrl(logoUrl);
+    if (!sanitized) {
+      return new Response("Bad Request", {
+        status: 400,
+        headers: securityHeaders(),
+      });
+    }
+
+    const result = await fetchLogoViaProxy(sanitized);
+    if (!result) {
+      // Return a 1x1 transparent PNG as fallback
+      const transparentPng = new Uint8Array([
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00,
+        0x0d, 0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
+        0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4, 0x89,
+        0x00, 0x00, 0x00, 0x0a, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x62,
+        0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0xe2, 0x21, 0xbc, 0x33, 0x00,
+        0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+      ]);
+      return new Response(transparentPng, {
+        status: 200,
+        headers: {
+          "Content-Type": "image/png",
+          "Cache-Control": "public, max-age=60",
+          ...securityHeaders(),
+        },
+      });
+    }
+
+    return new Response(result.data, {
+      status: 200,
+      headers: {
+        "Content-Type": result.contentType,
+        "Cache-Control": "public, max-age=300",
+        "Access-Control-Allow-Origin": "*",
+        ...securityHeaders(),
+      },
+    });
+  }
+
+  // --- 3. FRONTEND UI (HTML) ---
   if (url.pathname === "/") {
     return new Response(getHTML(), {
       headers: {
@@ -824,6 +941,12 @@ function getHTML(): string {
       return div.innerHTML;
     }
 
+    // ====== Convert original logo URL to proxied URL ======
+    function proxiedLogoUrl(originalUrl) {
+      if (!originalUrl) return null;
+      return "/api/logo-proxy?url=" + encodeURIComponent(originalUrl);
+    }
+
     document.getElementById("tabs").addEventListener("click", function(e) {
       var btn = e.target.closest(".tab-btn");
       if (!btn) return;
@@ -847,7 +970,7 @@ function getHTML(): string {
         if (data.error) throw new Error(data.error);
         allData = data;
         document.getElementById("loading").style.display = "none";
-        // Preload logo images into cache
+        // Preload logo images into cache (via proxy)
         preloadLogos(data);
         updateStats();
         renderMatches();
@@ -863,8 +986,9 @@ function getHTML(): string {
       matches.forEach(function(m) {
         [m.home_team_logo, m.away_team_logo].forEach(function(url) {
           if (url && !logoCache[url]) {
+            var proxyUrl = proxiedLogoUrl(url);
             var img = new Image();
-            img.src = url;
+            img.src = proxyUrl;
             img.onload = function() { logoCache[url] = "ok"; };
             img.onerror = function() { logoCache[url] = "fail"; };
           }
@@ -889,12 +1013,13 @@ function getHTML(): string {
         return fallback;
       }
       if (url) {
+        var proxyUrl = proxiedLogoUrl(url);
         var img = document.createElement("img");
         img.className = "team-logo";
         img.loading = "eager";
         img.decoding = "async";
         img.alt = "";
-        img.src = url;
+        img.src = proxyUrl;
         img.onerror = function() {
           logoCache[url] = "fail";
           var fb = document.createElement("div");
@@ -1260,9 +1385,6 @@ function getHTML(): string {
 }
 
 // ====== BACKEND LOGIC ======
-
-// ====== Logo proxy cache to avoid repeated slow external fetches ======
-const logoProxyCache = new Map<string, { data: Uint8Array; contentType: string; expires: number }>();
 
 async function fetchServerURL(roomNum: any) {
   try {
