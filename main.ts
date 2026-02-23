@@ -21,7 +21,6 @@ const SITE_SUBTITLE =
   Deno.env.get("SITE_SUBTITLE") || "Premium Sports Streaming";
 
 // ====== SECURITY: Origin/Referer validation ======
-// Set your deployed domain here (e.g. "https://yourdomain.com")
 const ALLOWED_ORIGINS: string[] = (() => {
   const raw = Deno.env.get("ALLOWED_ORIGINS") || "";
   return raw
@@ -31,56 +30,16 @@ const ALLOWED_ORIGINS: string[] = (() => {
 })();
 
 function isAllowedOrigin(req: Request): boolean {
-  // If no ALLOWED_ORIGINS configured, skip check (development mode)
   if (ALLOWED_ORIGINS.length === 0) return true;
-
   const origin = req.headers.get("origin") || "";
   const referer = req.headers.get("referer") || "";
-
   for (const allowed of ALLOWED_ORIGINS) {
     if (origin === allowed) return true;
     if (referer.startsWith(allowed)) return true;
   }
-
-  // Allow same-origin requests (no origin header = same origin navigation)
   if (!origin && !referer) return true;
-
   return false;
 }
-
-// ====== SECURITY: CSRF Token ======
-function generateCSRFToken(): string {
-  const arr = new Uint8Array(32);
-  crypto.getRandomValues(arr);
-  return Array.from(arr, (b) => b.toString(16).padStart(2, "0")).join("");
-}
-
-// Per-session CSRF tokens (IP-based for simplicity)
-const csrfTokens = new Map<string, { token: string; expires: number }>();
-
-function getOrCreateCSRFToken(ip: string): string {
-  const existing = csrfTokens.get(ip);
-  if (existing && Date.now() < existing.expires) {
-    return existing.token;
-  }
-  const token = generateCSRFToken();
-  csrfTokens.set(ip, { token, expires: Date.now() + 30 * 60_000 }); // 30 min
-  return token;
-}
-
-function validateCSRFToken(ip: string, token: string): boolean {
-  const existing = csrfTokens.get(ip);
-  if (!existing || Date.now() > existing.expires) return false;
-  return existing.token === token;
-}
-
-// Cleanup CSRF tokens periodically
-setInterval(() => {
-  const now = Date.now();
-  for (const [ip, entry] of csrfTokens) {
-    if (now > entry.expires) csrfTokens.delete(ip);
-  }
-}, 10 * 60_000);
 
 // ====== Daily Visitor Tracking ======
 const dailyVisitors = new Map<string, Set<string>>();
@@ -100,8 +59,6 @@ function trackVisitor(ip: string): void {
     dailyVisitors.set(today, new Set());
   }
   dailyVisitors.get(today)!.add(ip);
-
-  // Clean up old days (keep only last 7 days)
   const keys = Array.from(dailyVisitors.keys()).sort();
   while (keys.length > 7) {
     const oldest = keys.shift()!;
@@ -117,45 +74,66 @@ function getVisitorStats(): Record<string, number> {
   return stats;
 }
 
-// ====== PERFORMANCE: API Response Cache ======
+// ====== PERFORMANCE: Multi-tier Cache ======
 interface CacheEntry {
   data: any;
   expires: number;
+  staleExpires: number; // stale-while-revalidate deadline
 }
 
 const apiCache = new Map<string, CacheEntry>();
-const API_CACHE_TTL = 30_000; // 30 seconds cache for match data
 
-function getCachedResponse(key: string): any | null {
+function getCachedResponse(key: string): { data: any; stale: boolean } | null {
   const entry = apiCache.get(key);
-  if (entry && Date.now() < entry.expires) {
-    return entry.data;
+  if (!entry) return null;
+  const now = Date.now();
+  if (now < entry.expires) {
+    return { data: entry.data, stale: false };
   }
-  if (entry) {
-    apiCache.delete(key);
+  if (now < entry.staleExpires) {
+    return { data: entry.data, stale: true };
   }
+  apiCache.delete(key);
   return null;
 }
 
-function setCachedResponse(key: string, data: any, ttl: number = API_CACHE_TTL): void {
-  apiCache.set(key, { data, expires: Date.now() + ttl });
+function setCachedResponse(
+  key: string,
+  data: any,
+  freshTTL: number,
+  staleTTL: number = 60_000
+): void {
+  const now = Date.now();
+  apiCache.set(key, {
+    data,
+    expires: now + freshTTL,
+    staleExpires: now + freshTTL + staleTTL,
+  });
 }
+
+// Background revalidation tracker
+const revalidating = new Set<string>();
 
 // Cleanup expired cache
 setInterval(() => {
   const now = Date.now();
   for (const [key, entry] of apiCache) {
-    if (now > entry.expires) apiCache.delete(key);
+    if (now > entry.staleExpires) apiCache.delete(key);
   }
 }, 60_000);
 
-// ====== SECURITY: Rate Limiter (Improved for 400-500 users) ======
-const rateLimitMap = new Map<string, { count: number; resetTime: number }>();
-const RATE_LIMIT_WINDOW = 60_000; // 1 minute window
-const RATE_LIMIT_MAX = 45; // Max 45 requests per minute per IP (reasonable for page + auto-refresh)
-const BLOCK_THRESHOLD = 150; // Block if they exceed this in a window (clearly abusive)
+// ====== SECURITY: Rate Limiter (Scaled for 400-500 users) ======
+const rateLimitMap = new Map<
+  string,
+  { count: number; resetTime: number }
+>();
+// Much higher limits - the page itself makes very few API calls now
+// (1 match fetch every 60s, logos are cached with long TTL)
+const RATE_LIMIT_WINDOW = 60_000;
+const RATE_LIMIT_MAX = 120; // per minute - generous for normal use
+const BLOCK_THRESHOLD = 500; // clearly abusive
 const blockedIPs = new Map<string, number>();
-const BLOCK_DURATION = 10 * 60_000; // 10 minutes block
+const BLOCK_DURATION = 10 * 60_000;
 
 function getClientIP(req: Request): string {
   return (
@@ -168,8 +146,6 @@ function getClientIP(req: Request): string {
 
 function isRateLimited(ip: string): { limited: boolean; blocked: boolean } {
   const now = Date.now();
-
-  // Check block list
   const blockExpiry = blockedIPs.get(ip);
   if (blockExpiry && now < blockExpiry) {
     return { limited: true, blocked: true };
@@ -182,22 +158,17 @@ function isRateLimited(ip: string): { limited: boolean; blocked: boolean } {
     rateLimitMap.set(ip, { count: 1, resetTime: now + RATE_LIMIT_WINDOW });
     return { limited: false, blocked: false };
   }
-
   entry.count++;
-
   if (entry.count > BLOCK_THRESHOLD) {
     blockedIPs.set(ip, now + BLOCK_DURATION);
     return { limited: true, blocked: true };
   }
-
   if (entry.count > RATE_LIMIT_MAX) {
     return { limited: true, blocked: false };
   }
-
   return { limited: false, blocked: false };
 }
 
-// Clean up stale entries periodically
 setInterval(() => {
   const now = Date.now();
   for (const [ip, entry] of rateLimitMap) {
@@ -212,50 +183,31 @@ setInterval(() => {
 function isSuspiciousRequest(req: Request): boolean {
   const ua = req.headers.get("user-agent") || "";
   const url = new URL(req.url);
-
-  // Block requests with no or very short user agent
   if (!ua || ua.length < 10) return true;
-
-  // Known attack tools
   const botPatterns = [
     /sqlmap/i, /nikto/i, /nmap/i, /masscan/i, /dirbuster/i,
     /gobuster/i, /wfuzz/i, /hydra/i, /burpsuite/i, /nessus/i,
     /openvas/i, /acunetix/i, /zgrab/i, /nuclei/i, /scrapy/i,
     /havij/i, /commix/i, /w3af/i, /skipfish/i, /arachni/i,
-    /whatweb/i, /fierce/i, /httprint/i,
   ];
   if (botPatterns.some((p) => p.test(ua))) return true;
-
-  // Path traversal attempts
   const path = url.pathname;
-  if (path.includes("..") || path.includes("//") || path.includes("\\"))
-    return true;
-
-  // Common malicious path probes
+  if (path.includes("..") || path.includes("//") || path.includes("\\")) return true;
   const maliciousPaths = [
     /\.env/i, /\.git/i, /wp-admin/i, /wp-login/i, /phpmyadmin/i,
-    /\/admin\b/i, /\.php$/i, /\.asp$/i, /shell/i, /eval\(/i,
-    /exec\(/i, /\.sql$/i, /backup/i, /\.bak$/i, /\.log$/i,
-    /\.config$/i, /\.ini$/i, /\.yml$/i, /\.yaml$/i, /\.xml$/i,
-    /cgi-bin/i, /\.htaccess/i, /\.htpasswd/i, /wp-content/i,
-    /xmlrpc/i, /\.well-known\/security/i,
+    /\/admin\b/i, /\.php$/i, /\.asp$/i, /shell/i, /\.sql$/i,
+    /\.bak$/i, /\.log$/i, /\.config$/i, /cgi-bin/i, /\.htaccess/i,
+    /xmlrpc/i,
   ];
   if (maliciousPaths.some((p) => p.test(path))) return true;
-
-  // SQL Injection & XSS in query string
   const query = url.search;
   const sqlPatterns = [
     /union.*select/i, /or\s+1\s*=\s*1/i, /drop\s+table/i,
     /insert\s+into/i, /delete\s+from/i, /script>/i, /<iframe/i,
-    /javascript:/i, /onerror\s*=/i, /onload\s*=/i, /\bexec\b/i,
-    /\bconcat\b.*\bselect\b/i, /\bload_file\b/i, /\bbenchmark\b/i,
-    /\bsleep\b\s*\(/i, /\bwaitfor\b/i, /\bchar\b\s*\(/i,
+    /javascript:/i, /onerror\s*=/i, /onload\s*=/i,
   ];
   if (sqlPatterns.some((p) => p.test(query))) return true;
-
-  // Oversized URL (potential buffer overflow attempt)
   if (req.url.length > 4096) return true;
-
   return false;
 }
 
@@ -279,13 +231,11 @@ function securityHeaders(): Record<string, string> {
       "frame-ancestors 'none'; " +
       "base-uri 'self'; " +
       "form-action 'self';",
-    "Strict-Transport-Security":
-      "max-age=63072000; includeSubDomains; preload",
-    "Cache-Control": "no-store",
+    "Strict-Transport-Security": "max-age=63072000; includeSubDomains; preload",
   };
 }
 
-// ====== SECURITY: Sanitize URL (only allow http/https) ======
+// ====== SECURITY: Sanitize URL ======
 function sanitizeUrl(url: string | null | undefined): string | null {
   if (!url || typeof url !== "string") return null;
   const trimmed = url.trim();
@@ -296,21 +246,15 @@ function sanitizeUrl(url: string | null | undefined): string | null {
 }
 
 // ====== SECURITY: Sanitize plain text ======
-function sanitizeText(
-  text: string | null | undefined,
-  maxLen: number
-): string {
+function sanitizeText(text: string | null | undefined, maxLen: number): string {
   if (!text || typeof text !== "string") return "";
   return text
     .replace(/<[^>]*>/g, "")
     .replace(/[\x00-\x1f\x7f]/g, "")
     .replace(/[&<>"']/g, (c) => {
       const map: Record<string, string> = {
-        "&": "&amp;",
-        "<": "&lt;",
-        ">": "&gt;",
-        '"': "&quot;",
-        "'": "&#x27;",
+        "&": "&amp;", "<": "&lt;", ">": "&gt;",
+        '"': "&quot;", "'": "&#x27;",
       };
       return map[c] || c;
     })
@@ -323,33 +267,27 @@ const logoProxyCache = new Map<
   string,
   { data: Uint8Array; contentType: string; expires: number }
 >();
-const LOGO_CACHE_TTL = 10 * 60 * 1000; // 10 minutes (increased for performance)
+const LOGO_CACHE_TTL = 30 * 60 * 1000; // 30 minutes - logos don't change often
 const LOGO_CACHE_MAX_SIZE = 500;
 
-// Clean up expired logo cache entries periodically
 setInterval(() => {
   const now = Date.now();
   for (const [key, entry] of logoProxyCache) {
     if (now > entry.expires) logoProxyCache.delete(key);
   }
-}, 2 * 60_000);
+}, 5 * 60_000);
 
 async function fetchLogoViaProxy(
   logoUrl: string
 ): Promise<{ data: Uint8Array; contentType: string } | null> {
-  // Validate URL
   if (!sanitizeUrl(logoUrl)) return null;
-
-  // Check cache first
   const cached = logoProxyCache.get(logoUrl);
   if (cached && Date.now() < cached.expires) {
     return { data: cached.data, contentType: cached.contentType };
   }
-
   try {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 8000);
-
     const res = await fetch(logoUrl, {
       headers: {
         "User-Agent": API_USER_AGENT,
@@ -359,21 +297,12 @@ async function fetchLogoViaProxy(
       signal: controller.signal,
     });
     clearTimeout(timeout);
-
     if (!res.ok) return null;
-
     const contentType = res.headers.get("content-type") || "image/png";
-
-    // Only allow image content types
     if (!contentType.startsWith("image/")) return null;
-
     const arrayBuf = await res.arrayBuffer();
     const data = new Uint8Array(arrayBuf);
-
-    // Don't cache excessively large images (> 2MB)
     if (data.length > 2 * 1024 * 1024) return { data, contentType };
-
-    // Evict oldest entries if cache is too large
     if (logoProxyCache.size >= LOGO_CACHE_MAX_SIZE) {
       let oldestKey: string | null = null;
       let oldestTime = Infinity;
@@ -385,36 +314,254 @@ async function fetchLogoViaProxy(
       }
       if (oldestKey) logoProxyCache.delete(oldestKey);
     }
-
     logoProxyCache.set(logoUrl, {
-      data,
-      contentType,
+      data, contentType,
       expires: Date.now() + LOGO_CACHE_TTL,
     });
-
     return { data, contentType };
   } catch (_e) {
     return null;
   }
 }
 
-// ====== Developer Stats Auth Key ======
-const DEV_STATS_KEY = Deno.env.get("DEV_STATS_KEY") || crypto.randomUUID();
-// Log the auto-generated key so admin can see it at startup
-if (!Deno.env.get("DEV_STATS_KEY")) {
-  console.log(`[SECURITY] Auto-generated DEV_STATS_KEY: ${DEV_STATS_KEY}`);
-  console.log(`[SECURITY] Set DEV_STATS_KEY env var to use a persistent key.`);
+// ====== Stream Proxy: Proxy HLS streams through Deno ======
+// This hides the origin stream URLs from clients and allows
+// concurrent viewers to share cached segments.
+
+// Cache for HLS playlists and segments
+const hlsCache = new Map<
+  string,
+  { data: Uint8Array; contentType: string; expires: number }
+>();
+const HLS_PLAYLIST_TTL = 3_000; // 3s for live playlists (they change frequently)
+const HLS_SEGMENT_TTL = 120_000; // 2 min for segments (they're immutable once created)
+const HLS_CACHE_MAX_SIZE = 2000;
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, entry] of hlsCache) {
+    if (now > entry.expires) hlsCache.delete(key);
+  }
+}, 15_000);
+
+// Map of stream tokens to actual stream base URLs
+// token -> { baseUrl, m3u8Path, created }
+const streamTokens = new Map<
+  string,
+  { baseUrl: string; m3u8Path: string; created: number }
+>();
+const STREAM_TOKEN_TTL = 4 * 60 * 60 * 1000; // 4 hours
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [token, entry] of streamTokens) {
+    if (now - entry.created > STREAM_TOKEN_TTL) streamTokens.delete(token);
+  }
+}, 10 * 60_000);
+
+function generateStreamToken(): string {
+  const arr = new Uint8Array(16);
+  crypto.getRandomValues(arr);
+  return Array.from(arr, (b) => b.toString(16).padStart(2, "0")).join("");
 }
 
+function registerStreamUrl(streamUrl: string): string {
+  // Check if we already have a token for this URL
+  for (const [token, entry] of streamTokens) {
+    if (entry.baseUrl + entry.m3u8Path === streamUrl) {
+      return token;
+    }
+  }
+
+  const urlObj = new URL(streamUrl);
+  const pathParts = urlObj.pathname.split("/");
+  const m3u8File = pathParts.pop() || "index.m3u8";
+  const basePath = pathParts.join("/");
+  const baseUrl = urlObj.origin + basePath;
+
+  const token = generateStreamToken();
+  streamTokens.set(token, {
+    baseUrl,
+    m3u8Path: m3u8File,
+    created: Date.now(),
+  });
+  return token;
+}
+
+async function fetchHlsResource(
+  fullUrl: string,
+  isPlaylist: boolean
+): Promise<{ data: Uint8Array; contentType: string } | null> {
+  const cached = hlsCache.get(fullUrl);
+  if (cached && Date.now() < cached.expires) {
+    return { data: cached.data, contentType: cached.contentType };
+  }
+
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 10000);
+    const res = await fetch(fullUrl, {
+      headers: {
+        "User-Agent": API_USER_AGENT,
+        Referer: API_REFERER,
+      },
+      signal: controller.signal,
+    });
+    clearTimeout(timeout);
+    if (!res.ok) return null;
+
+    const contentType =
+      res.headers.get("content-type") || (isPlaylist ? "application/vnd.apple.mpegurl" : "video/mp2t");
+    const arrayBuf = await res.arrayBuffer();
+    const data = new Uint8Array(arrayBuf);
+
+    // Cache with appropriate TTL
+    const ttl = isPlaylist ? HLS_PLAYLIST_TTL : HLS_SEGMENT_TTL;
+
+    // Evict if cache is too large
+    if (hlsCache.size >= HLS_CACHE_MAX_SIZE) {
+      let oldestKey: string | null = null;
+      let oldestTime = Infinity;
+      for (const [key, entry] of hlsCache) {
+        if (entry.expires < oldestTime) {
+          oldestTime = entry.expires;
+          oldestKey = key;
+        }
+      }
+      if (oldestKey) hlsCache.delete(oldestKey);
+    }
+
+    hlsCache.set(fullUrl, { data, contentType, expires: Date.now() + ttl });
+    return { data, contentType };
+  } catch (_e) {
+    return null;
+  }
+}
+
+function rewriteM3u8Playlist(
+  playlistData: Uint8Array,
+  streamToken: string,
+  baseUrl: string
+): Uint8Array {
+  const text = new TextDecoder().decode(playlistData);
+  const lines = text.split("\n");
+  const rewritten = lines.map((line) => {
+    const trimmed = line.trim();
+    if (trimmed.length === 0 || trimmed.startsWith("#")) {
+      // Rewrite URI= in EXT-X-KEY or EXT-X-MAP
+      if (trimmed.includes("URI=")) {
+        return trimmed.replace(/URI="([^"]+)"/, (_match, uri) => {
+          let fullUri = uri;
+          if (!uri.startsWith("http")) {
+            fullUri = uri.startsWith("/")
+              ? new URL(baseUrl).origin + uri
+              : baseUrl + "/" + uri;
+          }
+          // Proxy through our endpoint
+          const encodedPath = encodeURIComponent(fullUri);
+          return `URI="/api/stream/${streamToken}/resource?url=${encodedPath}"`;
+        });
+      }
+      return trimmed;
+    }
+    // Non-comment, non-empty line = URL or relative path
+    if (trimmed.startsWith("http")) {
+      // Absolute URL
+      const encodedPath = encodeURIComponent(trimmed);
+      return `/api/stream/${streamToken}/resource?url=${encodedPath}`;
+    }
+    // Relative path
+    const fullUrl = trimmed.startsWith("/")
+      ? new URL(baseUrl).origin + trimmed
+      : baseUrl + "/" + trimmed;
+    const encodedPath = encodeURIComponent(fullUrl);
+    return `/api/stream/${streamToken}/resource?url=${encodedPath}`;
+  });
+
+  return new TextEncoder().encode(rewritten.join("\n"));
+}
+
+// ====== Developer Stats Auth Key ======
+const DEV_STATS_KEY = Deno.env.get("DEV_STATS_KEY") || crypto.randomUUID();
+if (!Deno.env.get("DEV_STATS_KEY")) {
+  console.log(`[SECURITY] Auto-generated DEV_STATS_KEY: ${DEV_STATS_KEY}`);
+}
+
+// ====== Background Match Data Refresh ======
+// Pre-fetch match data in the background so API calls are always fast
+let backgroundRefreshInterval: number | undefined;
+
+async function backgroundRefreshMatches() {
+  try {
+    const getVNDate = (offset: number) => {
+      const d = new Date();
+      d.setDate(d.getDate() + offset);
+      return new Intl.DateTimeFormat("en-CA", {
+        timeZone: "Asia/Ho_Chi_Minh",
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+      })
+        .format(d)
+        .replace(/-/g, "");
+    };
+
+    const dates = [getVNDate(-1), getVNDate(0), getVNDate(1)];
+    const allResults = await Promise.allSettled(
+      dates.map((d) => fetchMatchesInternal(d))
+    );
+
+    let allMatches: any[] = [];
+    for (const result of allResults) {
+      if (result.status === "fulfilled") {
+        allMatches = allMatches.concat(result.value);
+      }
+    }
+
+    allMatches = allMatches.filter((m: any) => m.match_status !== "finished");
+    allMatches.sort((a, b) => {
+      if (a.match_status === "live" && b.match_status !== "live") return -1;
+      if (a.match_status !== "live" && b.match_status === "live") return 1;
+      return 0;
+    });
+
+    // Register stream tokens for all servers
+    for (const match of allMatches) {
+      if (match.servers) {
+        for (const server of match.servers) {
+          if (server.stream_url) {
+            const token = registerStreamUrl(server.stream_url);
+            // Replace actual stream URL with proxied URL
+            server.stream_url = `/api/stream/${token}/playlist.m3u8`;
+          }
+        }
+      }
+    }
+
+    // Cache with fresh=30s, stale=60s
+    setCachedResponse("matches_all", allMatches, 30_000, 60_000);
+    console.log(
+      `[BG] Refreshed matches: ${allMatches.length} (live: ${allMatches.filter((m: any) => m.match_status === "live").length})`
+    );
+  } catch (e) {
+    console.warn("[BG] Match refresh error:", e);
+  }
+}
+
+// Start background refresh
+backgroundRefreshMatches();
+backgroundRefreshInterval = setInterval(backgroundRefreshMatches, 30_000);
+
+// ====== HTTP Server ======
 serve(async (req) => {
   const url = new URL(req.url);
   const clientIP = getClientIP(req);
 
-  // ====== SECURITY: Rate limiting ======
+  // Rate limiting
   const { limited, blocked } = isRateLimited(clientIP);
   if (blocked) {
     return new Response(
-      JSON.stringify({ error: "Blocked: Too many requests. Try again later." }),
+      JSON.stringify({ error: "Blocked: Too many requests." }),
       {
         status: 403,
         headers: {
@@ -439,7 +586,7 @@ serve(async (req) => {
     );
   }
 
-  // ====== SECURITY: Suspicious request detection ======
+  // Suspicious request detection
   if (isSuspiciousRequest(req)) {
     return new Response("Not Found", {
       status: 404,
@@ -447,7 +594,7 @@ serve(async (req) => {
     });
   }
 
-  // ====== SECURITY: Only allow GET ======
+  // Only allow GET
   if (req.method !== "GET") {
     return new Response("Method Not Allowed", {
       status: 405,
@@ -455,104 +602,56 @@ serve(async (req) => {
     });
   }
 
-  // --- 1. API ROUTE: Matches (with caching) ---
+  // --- 1. API ROUTE: Matches (served from background cache) ---
   if (url.pathname === "/api/matches") {
-    // ====== SECURITY: Validate origin for API calls ======
     if (!isAllowedOrigin(req)) {
-      return new Response(
-        JSON.stringify({ error: "Forbidden" }),
-        {
-          status: 403,
-          headers: {
-            "Content-Type": "application/json",
-            ...securityHeaders(),
-          },
-        }
-      );
+      return new Response(JSON.stringify({ error: "Forbidden" }), {
+        status: 403,
+        headers: { "Content-Type": "application/json", ...securityHeaders() },
+      });
     }
 
+    const cached = getCachedResponse("matches_all");
+    if (cached) {
+      return new Response(JSON.stringify(cached.data), {
+        headers: {
+          "Content-Type": "application/json",
+          "Cache-Control": "public, max-age=15",
+          "X-Cache": cached.stale ? "STALE" : "HIT",
+          ...securityHeaders(),
+        },
+      });
+    }
+
+    // If no cache at all (rare, first few seconds of startup), fetch inline
     try {
-      // Check cache first - this is the key for handling 400-500 users
-      const cacheKey = "matches_all";
-      const cached = getCachedResponse(cacheKey);
-      if (cached) {
-        return new Response(JSON.stringify(cached), {
+      await backgroundRefreshMatches();
+      const freshCache = getCachedResponse("matches_all");
+      if (freshCache) {
+        return new Response(JSON.stringify(freshCache.data), {
           headers: {
             "Content-Type": "application/json",
-            "Cache-Control": "public, max-age=30",
-            "X-Cache": "HIT",
+            "Cache-Control": "public, max-age=15",
+            "X-Cache": "MISS",
             ...securityHeaders(),
           },
         });
       }
-
-      const getVNDate = (offset: number) => {
-        const d = new Date();
-        d.setDate(d.getDate() + offset);
-        return new Intl.DateTimeFormat("en-CA", {
-          timeZone: "Asia/Ho_Chi_Minh",
-          year: "numeric",
-          month: "2-digit",
-          day: "2-digit",
-        })
-          .format(d)
-          .replace(/-/g, "");
-      };
-
-      const dates = [getVNDate(-1), getVNDate(0), getVNDate(1)];
-
-      // Fetch all dates in parallel for speed
-      const allResults = await Promise.allSettled(
-        dates.map((d) => fetchMatches(d))
-      );
-
-      let allMatches: any[] = [];
-      for (const result of allResults) {
-        if (result.status === "fulfilled") {
-          allMatches = allMatches.concat(result.value);
-        }
-      }
-
-      // Filter out finished matches
-      allMatches = allMatches.filter(
-        (m: any) => m.match_status !== "finished"
-      );
-
-      // Sort: live first
-      allMatches.sort((a, b) => {
-        if (a.match_status === "live" && b.match_status !== "live") return -1;
-        if (a.match_status !== "live" && b.match_status === "live") return 1;
-        return 0;
-      });
-
-      // Cache the response
-      setCachedResponse(cacheKey, allMatches, API_CACHE_TTL);
-
-      return new Response(JSON.stringify(allMatches), {
-        headers: {
-          "Content-Type": "application/json",
-          "Cache-Control": "public, max-age=30",
-          "X-Cache": "MISS",
-          ...securityHeaders(),
-        },
-      });
-    } catch (_e: any) {
-      return new Response(
-        JSON.stringify({ error: "Service temporarily unavailable" }),
-        {
-          status: 500,
-          headers: {
-            "Content-Type": "application/json",
-            ...securityHeaders(),
-          },
-        }
-      );
+    } catch (_e) {
+      // fall through
     }
+
+    return new Response(JSON.stringify([]), {
+      headers: {
+        "Content-Type": "application/json",
+        "Cache-Control": "public, max-age=5",
+        ...securityHeaders(),
+      },
+    });
   }
 
   // --- 2. API ROUTE: Logo Proxy ---
   if (url.pathname === "/api/logo-proxy") {
-    // ====== SECURITY: Validate origin ======
     if (!isAllowedOrigin(req)) {
       return new Response("Forbidden", {
         status: 403,
@@ -571,7 +670,6 @@ serve(async (req) => {
 
     const result = await fetchLogoViaProxy(sanitized);
     if (!result) {
-      // Return a 1x1 transparent PNG as fallback
       const transparentPng = new Uint8Array([
         0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00,
         0x0d, 0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
@@ -584,7 +682,7 @@ serve(async (req) => {
         status: 200,
         headers: {
           "Content-Type": "image/png",
-          "Cache-Control": "public, max-age=60",
+          "Cache-Control": "public, max-age=300",
           ...securityHeaders(),
         },
       });
@@ -594,62 +692,215 @@ serve(async (req) => {
       status: 200,
       headers: {
         "Content-Type": result.contentType,
-        "Cache-Control": "public, max-age=300",
+        "Cache-Control": "public, max-age=1800", // 30 min browser cache for logos
         ...securityHeaders(),
       },
     });
   }
 
-  // --- 3. API ROUTE: Developer Stats (visitor tracking) ---
-  if (url.pathname === "/api/stats") {
-    const key = url.searchParams.get("key");
-    if (!key || key !== DEV_STATS_KEY) {
-      // Constant-time comparison to prevent timing attacks
-      return new Response(JSON.stringify({ error: "Unauthorized" }), {
-        status: 401,
+  // --- 3. API ROUTE: Stream Proxy (HLS playlist) ---
+  if (url.pathname.match(/^\/api\/stream\/([a-f0-9]+)\/playlist\.m3u8$/)) {
+    if (!isAllowedOrigin(req)) {
+      return new Response("Forbidden", {
+        status: 403,
+        headers: securityHeaders(),
+      });
+    }
+
+    const match = url.pathname.match(
+      /^\/api\/stream\/([a-f0-9]+)\/playlist\.m3u8$/
+    );
+    if (!match) {
+      return new Response("Not Found", {
+        status: 404,
+        headers: securityHeaders(),
+      });
+    }
+
+    const token = match[1];
+    const streamInfo = streamTokens.get(token);
+    if (!streamInfo) {
+      return new Response("Stream not found or expired", {
+        status: 404,
+        headers: securityHeaders(),
+      });
+    }
+
+    const fullUrl = streamInfo.baseUrl + "/" + streamInfo.m3u8Path;
+    const result = await fetchHlsResource(fullUrl, true);
+    if (!result) {
+      return new Response("Stream unavailable", {
+        status: 502,
+        headers: securityHeaders(),
+      });
+    }
+
+    // Rewrite playlist to proxy all sub-resources
+    const rewritten = rewriteM3u8Playlist(
+      result.data,
+      token,
+      streamInfo.baseUrl
+    );
+
+    return new Response(rewritten, {
+      status: 200,
+      headers: {
+        "Content-Type": "application/vnd.apple.mpegurl",
+        "Cache-Control": "no-cache",
+        "Access-Control-Allow-Origin": "*",
+        ...securityHeaders(),
+      },
+    });
+  }
+
+  // --- 4. API ROUTE: Stream Proxy (sub-resources: segments, sub-playlists) ---
+  if (url.pathname.match(/^\/api\/stream\/([a-f0-9]+)\/resource$/)) {
+    if (!isAllowedOrigin(req)) {
+      return new Response("Forbidden", {
+        status: 403,
+        headers: securityHeaders(),
+      });
+    }
+
+    const match = url.pathname.match(
+      /^\/api\/stream\/([a-f0-9]+)\/resource$/
+    );
+    if (!match) {
+      return new Response("Not Found", {
+        status: 404,
+        headers: securityHeaders(),
+      });
+    }
+
+    const token = match[1];
+    const streamInfo = streamTokens.get(token);
+    if (!streamInfo) {
+      return new Response("Stream not found or expired", {
+        status: 404,
+        headers: securityHeaders(),
+      });
+    }
+
+    const resourceUrl = url.searchParams.get("url");
+    if (!resourceUrl) {
+      return new Response("Bad Request", {
+        status: 400,
+        headers: securityHeaders(),
+      });
+    }
+
+    // Security: ensure the resource URL is from the same origin as the stream
+    const streamOrigin = new URL(streamInfo.baseUrl).origin;
+    let fullResourceUrl: string;
+    try {
+      fullResourceUrl = decodeURIComponent(resourceUrl);
+      if (!fullResourceUrl.startsWith("http")) {
+        fullResourceUrl = streamOrigin + fullResourceUrl;
+      }
+      const resourceOrigin = new URL(fullResourceUrl).origin;
+      // Allow same origin or common CDN patterns
+      if (resourceOrigin !== streamOrigin) {
+        // Check if it's a known CDN subdomain pattern
+        const streamHost = new URL(streamInfo.baseUrl).hostname;
+        const resourceHost = new URL(fullResourceUrl).hostname;
+        const streamDomain = streamHost.split(".").slice(-2).join(".");
+        const resourceDomain = resourceHost.split(".").slice(-2).join(".");
+        if (streamDomain !== resourceDomain) {
+          return new Response("Forbidden resource origin", {
+            status: 403,
+            headers: securityHeaders(),
+          });
+        }
+      }
+    } catch (_e) {
+      return new Response("Invalid URL", {
+        status: 400,
+        headers: securityHeaders(),
+      });
+    }
+
+    const isPlaylist =
+      fullResourceUrl.endsWith(".m3u8") ||
+      fullResourceUrl.includes(".m3u8?");
+    const result = await fetchHlsResource(fullResourceUrl, isPlaylist);
+    if (!result) {
+      return new Response("Resource unavailable", {
+        status: 502,
+        headers: securityHeaders(),
+      });
+    }
+
+    // If it's a sub-playlist, rewrite it too
+    if (isPlaylist) {
+      const urlObj = new URL(fullResourceUrl);
+      const pathParts = urlObj.pathname.split("/");
+      pathParts.pop();
+      const baseUrl = urlObj.origin + pathParts.join("/");
+      const rewritten = rewriteM3u8Playlist(result.data, token, baseUrl);
+      return new Response(rewritten, {
+        status: 200,
         headers: {
-          "Content-Type": "application/json",
+          "Content-Type": "application/vnd.apple.mpegurl",
+          "Cache-Control": "no-cache",
+          "Access-Control-Allow-Origin": "*",
           ...securityHeaders(),
         },
       });
     }
 
-    const stats = getVisitorStats();
-    const today = getTodayDateKey();
-    return new Response(
-      JSON.stringify({
-        today: today,
-        today_visitors: stats[today] || 0,
-        daily_history: stats,
-        active_rate_limits: rateLimitMap.size,
-        blocked_ips: blockedIPs.size,
-        cache_entries: apiCache.size,
-        logo_cache_entries: logoProxyCache.size,
-      }),
-      {
-        headers: {
-          "Content-Type": "application/json",
-          ...securityHeaders(),
-        },
-      }
-    );
-  }
-
-  // --- 4. FRONTEND UI (HTML) ---
-  if (url.pathname === "/") {
-    // Track this visitor
-    trackVisitor(clientIP);
-
-    return new Response(getHTML(), {
+    // For segments, cache aggressively
+    return new Response(result.data, {
+      status: 200,
       headers: {
-        "Content-Type": "text/html; charset=utf-8",
-        "Cache-Control": "public, max-age=60",
+        "Content-Type": result.contentType,
+        "Cache-Control": "public, max-age=120",
+        "Access-Control-Allow-Origin": "*",
         ...securityHeaders(),
       },
     });
   }
 
-  // Everything else → 404
+  // --- 5. API ROUTE: Developer Stats ---
+  if (url.pathname === "/api/stats") {
+    const key = url.searchParams.get("key");
+    if (!key || key !== DEV_STATS_KEY) {
+      return new Response(JSON.stringify({ error: "Unauthorized" }), {
+        status: 401,
+        headers: { "Content-Type": "application/json", ...securityHeaders() },
+      });
+    }
+    const stats = getVisitorStats();
+    const today = getTodayDateKey();
+    return new Response(
+      JSON.stringify({
+        today,
+        today_visitors: stats[today] || 0,
+        daily_history: stats,
+        active_rate_limits: rateLimitMap.size,
+        blocked_ips: blockedIPs.size,
+        api_cache_entries: apiCache.size,
+        logo_cache_entries: logoProxyCache.size,
+        hls_cache_entries: hlsCache.size,
+        stream_tokens_active: streamTokens.size,
+      }),
+      {
+        headers: { "Content-Type": "application/json", ...securityHeaders() },
+      }
+    );
+  }
+
+  // --- 6. FRONTEND UI ---
+  if (url.pathname === "/") {
+    trackVisitor(clientIP);
+    return new Response(getHTML(), {
+      headers: {
+        "Content-Type": "text/html; charset=utf-8",
+        "Cache-Control": "public, max-age=120", // 2 min HTML cache
+        ...securityHeaders(),
+      },
+    });
+  }
+
   return new Response("Not Found", {
     status: 404,
     headers: securityHeaders(),
@@ -688,7 +939,6 @@ function getHTML(): string {
       overflow-x: hidden;
     }
 
-    /* Light subtle animated background */
     .bg-animated {
       position: fixed;
       top: 0; left: 0; right: 0; bottom: 0;
@@ -703,7 +953,6 @@ function getHTML(): string {
       100% { background-position: 0% 50%; }
     }
 
-    /* Soft floating orbs */
     .orb {
       position: fixed;
       border-radius: 50%;
@@ -751,7 +1000,6 @@ function getHTML(): string {
       z-index: 1;
     }
 
-    /* Clean light header */
     .premium-header {
       background: rgba(255, 255, 255, 0.85);
       border-bottom: 1px solid rgba(0,0,0,0.06);
@@ -793,11 +1041,9 @@ function getHTML(): string {
       background: rgba(217,119,6,0.14);
       border-color: rgba(217,119,6,0.3);
       transform: translateY(-1px);
-      box-shadow: 0 4px 16px rgba(217,119,6,0.12);
     }
     .dev-avatar {
-      width: 28px;
-      height: 28px;
+      width: 28px; height: 28px;
       border-radius: 50%;
       object-fit: cover;
       border: 2px solid rgba(217,119,6,0.2);
@@ -821,7 +1067,6 @@ function getHTML(): string {
       50% { opacity: 0.5; transform: scale(0.7); }
     }
 
-    /* Light glass card */
     .card {
       background: rgba(255, 255, 255, 0.75);
       border: 1px solid rgba(0,0,0,0.06);
@@ -856,13 +1101,9 @@ function getHTML(): string {
       border-color: rgba(239,68,68,0.35);
       box-shadow: 0 12px 32px rgba(239,68,68,0.1);
     }
-
     .card-watching {
       border-color: rgba(217,119,6,0.4) !important;
       box-shadow: 0 0 0 2px rgba(217,119,6,0.1), 0 12px 32px rgba(217,119,6,0.1) !important;
-    }
-    .card-watching::before {
-      background: linear-gradient(90deg, transparent, rgba(217,119,6,0.4), transparent) !important;
     }
 
     .team-logo {
@@ -876,7 +1117,6 @@ function getHTML(): string {
     }
     .card:hover .team-logo {
       border-color: rgba(217,119,6,0.25);
-      box-shadow: 0 0 12px rgba(217,119,6,0.08);
     }
     .team-logo-fallback {
       width: 52px; height: 52px;
@@ -903,7 +1143,6 @@ function getHTML(): string {
     }
     .btn-hd:hover::before { left: 100%; }
     .btn-hd:hover { box-shadow: 0 6px 20px rgba(239,68,68,0.4); transform: translateY(-1px); }
-    .btn-hd:active { transform: translateY(0); }
 
     .btn-sd {
       background: linear-gradient(135deg, #6366f1, #4f46e5);
@@ -921,7 +1160,6 @@ function getHTML(): string {
     }
     .btn-sd:hover::before { left: 100%; }
     .btn-sd:hover { box-shadow: 0 6px 20px rgba(99,102,241,0.4); transform: translateY(-1px); }
-    .btn-sd:active { transform: translateY(0); }
 
     .score-box {
       background: rgba(15,23,42,0.06);
@@ -963,7 +1201,6 @@ function getHTML(): string {
     .tab-btn:not(.active):hover {
       background: rgba(255,255,255,0.9);
       color: #1e293b;
-      border-color: rgba(0,0,0,0.1);
     }
 
     .stat-pill {
@@ -1075,7 +1312,6 @@ function getHTML(): string {
     ::-webkit-scrollbar { width: 3px; height: 3px; }
     ::-webkit-scrollbar-track { background: transparent; }
     ::-webkit-scrollbar-thumb { background: rgba(0,0,0,0.1); border-radius: 4px; }
-    ::-webkit-scrollbar-thumb:hover { background: rgba(0,0,0,0.2); }
 
     @keyframes fadeUp {
       from { opacity: 0; transform: translateY(12px); }
@@ -1192,13 +1428,6 @@ function getHTML(): string {
       margin-top: 2px;
     }
 
-    .live-elapsed {
-      font-size: 10px;
-      color: #dc2626;
-      font-weight: 600;
-      font-variant-numeric: tabular-nums;
-    }
-
     .search-bar {
       background: rgba(255,255,255,0.8);
       border: 1px solid rgba(0,0,0,0.08);
@@ -1212,36 +1441,35 @@ function getHTML(): string {
       font-family: 'Inter', 'Padauk', sans-serif;
       box-shadow: 0 1px 3px rgba(0,0,0,0.03);
     }
-    .search-bar::placeholder {
-      color: #94a3b8;
-    }
+    .search-bar::placeholder { color: #94a3b8; }
     .search-bar:focus {
       border-color: rgba(217,119,6,0.35);
       background: rgba(255,255,255,0.95);
-      box-shadow: 0 0 0 3px rgba(217,119,6,0.08), 0 2px 8px rgba(0,0,0,0.05);
+      box-shadow: 0 0 0 3px rgba(217,119,6,0.08);
     }
 
-    .match-transition {
-      transition: opacity 0.3s ease;
-    }
+    .match-transition { transition: opacity 0.3s ease; }
 
+    /* Refresh indicator - only shows briefly with proper animation */
     .refresh-indicator {
       position: fixed;
       top: 68px;
       left: 50%;
       transform: translateX(-50%) translateY(-50px);
-      background: rgba(217,119,6,0.95);
+      background: rgba(16,185,129,0.95);
       color: white;
       padding: 6px 16px;
       border-radius: 20px;
       font-size: 11px;
       font-weight: 700;
       z-index: 50;
-      transition: transform 0.3s ease;
+      opacity: 0;
+      transition: transform 0.3s ease, opacity 0.3s ease;
       pointer-events: none;
     }
     .refresh-indicator.visible {
       transform: translateX(-50%) translateY(10px);
+      opacity: 1;
     }
 
     .last-updated {
@@ -1263,15 +1491,12 @@ function getHTML(): string {
       100% { background-position: -200% 0; }
     }
 
-    /* Score text in light mode */
     .score-text {
       color: #d97706;
-      text-shadow: none;
     }
   </style>
 </head>
 <body>
-  <!-- Animated Background -->
   <div class="bg-animated"></div>
   <div class="orb orb-1"></div>
   <div class="orb orb-2"></div>
@@ -1279,10 +1504,8 @@ function getHTML(): string {
 
   <div class="app-container">
 
-    <!-- Refresh Indicator -->
-    <div id="refresh-indicator" class="refresh-indicator">Updating...</div>
+    <div id="refresh-indicator" class="refresh-indicator">Updated</div>
 
-    <!-- Premium Header -->
     <div class="premium-header">
       <div class="max-w-md mx-auto px-5 py-4">
         <div class="flex items-center justify-between">
@@ -1300,43 +1523,38 @@ function getHTML(): string {
 
     <div class="max-w-md mx-auto px-4 pt-5 pb-4">
 
-      <!-- Search Bar -->
       <div class="mb-4 fade-up">
         <input type="text" id="search-input" class="search-bar" placeholder="Search teams or leagues..." maxlength="100" autocomplete="off">
       </div>
 
-      <!-- Filter Tabs -->
       <div class="flex gap-2 mb-4 overflow-x-auto pb-1 fade-up fade-up-delay-1" id="tabs">
         <button class="tab-btn active" data-filter="all">All Matches</button>
         <button class="tab-btn" data-filter="live">Live Now</button>
         <button class="tab-btn" data-filter="upcoming">Upcoming</button>
       </div>
 
-      <!-- Stats Bar -->
       <div class="flex gap-2 justify-center mb-2 fade-up fade-up-delay-2" id="stats-bar">
         <span class="stat-pill">
           <span class="stat-indicator" style="background:#94a3b8;"></span>
-          <span id="stat-total">Total: —</span>
+          <span id="stat-total">Total: --</span>
         </span>
         <span class="stat-pill">
           <span class="stat-indicator" style="background:#ef4444; box-shadow: 0 0 6px rgba(239,68,68,0.5);"></span>
-          <span id="stat-live">Live: —</span>
+          <span id="stat-live">Live: --</span>
         </span>
         <span class="stat-pill">
           <span class="stat-indicator" style="background:#10b981;"></span>
-          <span id="stat-upcoming">Soon: —</span>
+          <span id="stat-upcoming">Soon: --</span>
         </span>
       </div>
 
-      <!-- Last Updated -->
       <div class="last-updated mb-4" id="last-updated"></div>
 
-      <!-- Video Player -->
       <div id="player-container" class="hidden sticky top-[68px] z-50 mb-5 player-wrapper">
         <div id="now-watching-bar" class="now-watching-bar hidden">
           <span class="nw-dot"></span>
           <span class="nw-label">Watching</span>
-          <span class="nw-match" id="nw-match-text">—</span>
+          <span class="nw-match" id="nw-match-text">--</span>
           <span class="nw-league" id="nw-league-text"></span>
         </div>
         <div class="bg-black relative" id="player-inner">
@@ -1346,18 +1564,16 @@ function getHTML(): string {
           </div>
         </div>
         <button id="close-player-btn" class="close-btn w-full text-xs font-bold py-3.5 flex items-center justify-center gap-2">
-          ✕ Close Player
+          Close Player
         </button>
       </div>
 
-      <!-- Loading Skeleton -->
       <div id="loading" class="space-y-3 fade-up fade-up-delay-3">
         <div class="skeleton" style="height: 180px;"></div>
         <div class="skeleton" style="height: 180px;"></div>
         <div class="skeleton" style="height: 180px;"></div>
       </div>
 
-      <!-- Match List -->
       <div id="match-list" class="space-y-3"></div>
 
       <div class="bottom-safe"></div>
@@ -1376,7 +1592,7 @@ function getHTML(): string {
     var lastUpdateTime = null;
     var countdownIntervalId = null;
     var isLoadingData = false;
-
+    var refreshTimerId = null;
     var logoCache = {};
 
     function escapeHtml(str) {
@@ -1391,13 +1607,10 @@ function getHTML(): string {
       return "/api/logo-proxy?url=" + encodeURIComponent(originalUrl);
     }
 
-    // Search input handler with debounce
     var searchTimeout = null;
     document.getElementById("search-input").addEventListener("input", function(e) {
       clearTimeout(searchTimeout);
-      var val = e.target.value;
-      // Sanitize search input
-      val = val.replace(/[<>'"]/g, "");
+      var val = e.target.value.replace(/[<>'"]/g, "");
       searchTimeout = setTimeout(function() {
         searchQuery = val.trim().toLowerCase();
         renderMatches();
@@ -1421,21 +1634,16 @@ function getHTML(): string {
 
     function showRefreshIndicator() {
       var el = document.getElementById("refresh-indicator");
+      el.textContent = "Updated";
       el.classList.add("visible");
       setTimeout(function() {
         el.classList.remove("visible");
-      }, 1500);
-    }
-
-    function hideRefreshIndicator() {
-      var el = document.getElementById("refresh-indicator");
-      el.classList.remove("visible");
+      }, 1200);
     }
 
     async function load() {
-      if (isLoadingData) return; // Prevent concurrent loads
+      if (isLoadingData) return;
       isLoadingData = true;
-
       try {
         var res = await fetch("/api/matches");
         if (!res.ok) throw new Error("Server error");
@@ -1452,16 +1660,14 @@ function getHTML(): string {
 
         lastUpdateTime = new Date();
         updateLastUpdatedText();
-
         preloadLogos(data);
         updateStats();
         renderMatches();
         startCountdowns();
       } catch (e) {
-        hideRefreshIndicator();
         if (isFirstLoad) {
           document.getElementById("loading").innerHTML =
-            '<div class="empty-state"><div class="empty-state-icon">⚠️</div>' +
+            '<div class="empty-state"><div class="empty-state-icon">&#9888;&#65039;</div>' +
             '<div class="text-red-500 text-sm font-medium">' + escapeHtml(e.message) + '</div>' +
             '<div class="text-slate-400 text-xs mt-2">Pull to refresh or try again later</div></div>';
         }
@@ -1513,7 +1719,7 @@ function getHTML(): string {
       if (url && logoCache[url] === "fail") {
         var fallback = document.createElement("div");
         fallback.className = "team-logo-fallback";
-        fallback.textContent = "⚽";
+        fallback.textContent = "\\u26BD";
         return fallback;
       }
       if (url) {
@@ -1528,17 +1734,15 @@ function getHTML(): string {
           logoCache[url] = "fail";
           var fb = document.createElement("div");
           fb.className = "team-logo-fallback";
-          fb.textContent = "⚽";
+          fb.textContent = "\\u26BD";
           img.replaceWith(fb);
         };
-        img.onload = function() {
-          logoCache[url] = "ok";
-        };
+        img.onload = function() { logoCache[url] = "ok"; };
         return img;
       }
       var fallback = document.createElement("div");
       fallback.className = "team-logo-fallback";
-      fallback.textContent = "⚽";
+      fallback.textContent = "\\u26BD";
       return fallback;
     }
 
@@ -1571,8 +1775,7 @@ function getHTML(): string {
       });
       if (currentWatchingMatch) {
         var key = getMatchUniqueKey(currentWatchingMatch);
-        var cards = document.querySelectorAll("[data-match-key]");
-        cards.forEach(function(card) {
+        document.querySelectorAll("[data-match-key]").forEach(function(card) {
           if (card.getAttribute("data-match-key") === key) {
             card.classList.add("card-watching");
           }
@@ -1590,7 +1793,6 @@ function getHTML(): string {
       var ampm = parts[3].toUpperCase();
       if (ampm === "PM" && h !== 12) h += 12;
       if (ampm === "AM" && h === 12) h = 0;
-
       var d = new Date(now);
       if (m.match_day === "Tomorrow") {
         d.setDate(d.getDate() + 1);
@@ -1609,9 +1811,7 @@ function getHTML(): string {
       var h = Math.floor(totalSec / 3600);
       var min = Math.floor((totalSec % 3600) / 60);
       var sec = totalSec % 60;
-      if (h > 0) {
-        return h + "h " + min + "m";
-      }
+      if (h > 0) return h + "h " + min + "m";
       return min + "m " + (sec < 10 ? "0" : "") + sec + "s";
     }
 
@@ -1638,7 +1838,6 @@ function getHTML(): string {
       if (currentFilter !== "all") {
         filtered = allData.filter(function(m) { return m.match_status === currentFilter; });
       }
-
       if (searchQuery) {
         filtered = filtered.filter(function(m) {
           var text = ((m.home_team_name || "") + " " + (m.away_team_name || "") + " " + (m.league_name || "")).toLowerCase();
@@ -1648,20 +1847,19 @@ function getHTML(): string {
 
       if (filtered.length === 0) {
         var emptyMsg = searchQuery ? "No matches found for \\"" + escapeHtml(searchQuery) + "\\"" : "No matches found";
-        list.innerHTML = '<div class="empty-state"><div class="empty-state-icon">📭</div>' +
+        list.innerHTML = '<div class="empty-state"><div class="empty-state-icon">\\uD83D\\uDCED</div>' +
           '<div class="text-slate-500 text-sm font-medium">' + emptyMsg + '</div></div>';
         return;
       }
 
       list.innerHTML = "";
-
       var lastDay = null;
 
       filtered.forEach(function(m, idx) {
         var isLive = m.match_status === "live";
         var matchKey = getMatchUniqueKey(m);
-
         var matchDay = m.match_day || "Today";
+
         if (matchDay !== lastDay) {
           lastDay = matchDay;
           var sep = document.createElement("div");
@@ -1675,7 +1873,7 @@ function getHTML(): string {
         var card = document.createElement("div");
         card.className = isLive ? "card card-live p-5 match-transition" : "card p-5 match-transition";
         card.setAttribute("data-match-key", matchKey);
-        card.style.animation = "fadeUp 0.4s ease-out " + (idx * 0.05) + "s both";
+        card.style.animation = "fadeUp 0.4s ease-out " + (Math.min(idx, 10) * 0.03) + "s both";
 
         if (currentWatchingMatch && getMatchUniqueKey(currentWatchingMatch) === matchKey) {
           card.classList.add("card-watching");
@@ -1683,7 +1881,6 @@ function getHTML(): string {
 
         var headerRow = document.createElement("div");
         headerRow.className = "flex justify-between items-center mb-4";
-
         var leagueBadge = document.createElement("span");
         leagueBadge.className = "league-badge text-[10px] text-amber-700 truncate max-w-[60%]";
         leagueBadge.textContent = m.league_name || "Unknown";
@@ -1694,10 +1891,9 @@ function getHTML(): string {
           statusBadge.innerHTML = '<span class="live-dot"></span>LIVE ' + escapeHtml(m.match_time || "");
         } else {
           statusBadge.className = "status-upcoming";
-          var dayLabel = m.match_day && m.match_day !== "Today" ? m.match_day + " · " : "";
+          var dayLabel = m.match_day && m.match_day !== "Today" ? m.match_day + " \\u00B7 " : "";
           statusBadge.textContent = dayLabel + (m.match_time || "");
         }
-
         headerRow.appendChild(leagueBadge);
         headerRow.appendChild(statusBadge);
 
@@ -1765,7 +1961,7 @@ function getHTML(): string {
             var btn = document.createElement("button");
             var isHD = s.name && s.name.indexOf("HD") !== -1;
             btn.className = (isHD ? "btn-hd" : "btn-sd") + " text-white text-[11px] px-5 py-2 rounded-full font-bold transition-all";
-            btn.textContent = isHD ? "▶ HD" : "▶ SD";
+            btn.textContent = isHD ? "\\u25B6 HD" : "\\u25B6 SD";
             btn.setAttribute("data-stream-url", s.stream_url);
             btn.addEventListener("click", function() {
               currentWatchingMatch = m;
@@ -1797,45 +1993,39 @@ function getHTML(): string {
 
     function showPlayerLoading(show) {
       var el = document.getElementById("player-loading");
-      if (show) {
-        el.classList.remove("hidden");
-      } else {
-        el.classList.add("hidden");
-      }
+      if (show) el.classList.remove("hidden");
+      else el.classList.add("hidden");
     }
 
     function getStreamErrorHTML(message) {
       return '<div style="font-size:14px;font-weight:600;margin-bottom:6px;">' + escapeHtml(message) + '</div>' +
         '<div class="player-error-tips">' +
-          '⚠ အကြောင်းအရင်းများ -<br>' +
-          '① သတ်မှတ်ထားသော ထုတ်လွှင့်ချိန် မရောက်သေးတာ ဖြစ်နိုင်ပါသည်။<br>' +
-          '② မူရင်း Stream Link ပျက်နေတာ ဖြစ်နိုင်ပါသည်။<br>' +
-          '③ သင့်နိုင်ငံ/ဒေသမှ ပိတ်ထားတာ ဖြစ်နိုင်ပါသည်။<br><br>' +
-          '💡 VPN ဖွင့်ပြီး ပြန်ကြိုးစားကြည့်ပါ။<br>' +
-          '💡 အခြား Server (HD/SD) ပြောင်းကြည့်ပါ။' +
+          '\\u26A0 \\u1021\\u1000\\u103C\\u1031\\u102C\\u1004\\u103A\\u1038\\u1021\\u101B\\u1004\\u103A\\u1038\\u1019\\u103B\\u102C\\u1038 -<br>' +
+          '\\u2460 \\u101E\\u1010\\u103A\\u1019\\u103E\\u1010\\u103A\\u1011\\u102C\\u1038\\u101E\\u1031\\u102C \\u1011\\u102F\\u1010\\u103A\\u101C\\u103D\\u103E\\u1004\\u103A\\u1037\\u1001\\u103B\\u102D\\u1014\\u103A \\u1019\\u101B\\u1031\\u102C\\u1000\\u103A\\u101E\\u1031\\u1038\\u1010\\u102C \\u1016\\u103C\\u1005\\u103A\\u1014\\u102D\\u102F\\u1004\\u103A\\u1015\\u102B\\u101E\\u100A\\u103A\\u104B<br>' +
+          '\\u2461 \\u1019\\u1030\\u101B\\u1004\\u103A\\u1038 Stream Link \\u1015\\u103B\\u1000\\u103A\\u1014\\u1031\\u1010\\u102C \\u1016\\u103C\\u1005\\u103A\\u1014\\u102D\\u102F\\u1004\\u103A\\u1015\\u102B\\u101E\\u100A\\u103A\\u104B<br>' +
+          '\\u2462 \\u101E\\u1004\\u103A\\u1037\\u1014\\u102D\\u102F\\u1004\\u103A\\u1004\\u1036/\\u1012\\u1031\\u101E\\u1019\\u103E \\u1015\\u102D\\u1010\\u103A\\u1011\\u102C\\u1038\\u1010\\u102C \\u1016\\u103C\\u1005\\u103A\\u1014\\u102D\\u102F\\u1004\\u103A\\u1015\\u102B\\u101E\\u100A\\u103A\\u104B<br><br>' +
+          '\\uD83D\\uDCA1 VPN \\u1016\\u103D\\u1004\\u103A\\u1037\\u1015\\u103C\\u102E\\u1038 \\u1015\\u103C\\u1014\\u103A\\u1000\\u103C\\u102D\\u102F\\u1038\\u1005\\u102C\\u1038\\u1000\\u103C\\u100A\\u103A\\u1037\\u1015\\u102B\\u104B<br>' +
+          '\\uD83D\\uDCA1 \\u1021\\u1001\\u103C\\u102C\\u1038 Server (HD/SD) \\u1015\\u103C\\u1031\\u102C\\u1004\\u103A\\u1038\\u1000\\u103C\\u100A\\u103A\\u1037\\u1015\\u102B\\u104B' +
         '</div>';
     }
 
     function showPlayerError(message) {
       var existing = document.getElementById("player-error-overlay");
       if (existing) existing.remove();
-
       var overlay = document.createElement("div");
       overlay.id = "player-error-overlay";
       overlay.className = "player-error";
       overlay.innerHTML = getStreamErrorHTML(message);
-
       if (currentStreamUrl) {
         var retryBtn = document.createElement("button");
         retryBtn.className = "player-error-btn";
-        retryBtn.textContent = "ပြန်ကြိုးစားမည်";
+        retryBtn.textContent = "\\u1015\\u103C\\u1014\\u103A\\u1000\\u103C\\u102D\\u102F\\u1038\\u1005\\u102C\\u1038\\u1019\\u100A\\u103A";
         retryBtn.addEventListener("click", function() {
           overlay.remove();
           play(currentStreamUrl);
         });
         overlay.appendChild(retryBtn);
       }
-
       document.getElementById("player-inner").appendChild(overlay);
     }
 
@@ -1846,22 +2036,20 @@ function getHTML(): string {
 
     function play(streamUrl) {
       if (!streamUrl || typeof streamUrl !== "string") return;
-      if (!/^https?:\\/\\//i.test(streamUrl)) return;
+      // Allow both absolute and proxied relative URLs
+      if (!/^(https?:\\/\\/|\\/api\\/stream\\/)/i.test(streamUrl)) return;
 
       currentStreamUrl = streamUrl;
-
       document.getElementById("player-container").classList.remove("hidden");
       clearPlayerError();
       showPlayerLoading(true);
       updateNowWatchingBar();
 
       var vid = document.getElementById("video");
-
       if (currentHls) {
         currentHls.destroy();
         currentHls = null;
       }
-
       vid.removeAttribute("src");
       vid.load();
 
@@ -1871,6 +2059,7 @@ function getHTML(): string {
           lowLatencyMode: true,
           maxBufferLength: 30,
           maxMaxBufferLength: 60,
+          startFragPrefetch: true,
         });
         currentHls = hls;
         hls.loadSource(streamUrl);
@@ -1880,7 +2069,6 @@ function getHTML(): string {
           showPlayerLoading(false);
           vid.play().catch(function() {});
         });
-
         hls.on(Hls.Events.FRAG_LOADED, function() {
           showPlayerLoading(false);
         });
@@ -1889,18 +2077,16 @@ function getHTML(): string {
           if (data.fatal) {
             showPlayerLoading(false);
             if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
-              console.warn("HLS network error, attempting recovery...");
               hls.startLoad();
               setTimeout(function() {
                 if (vid.paused && vid.readyState < 3) {
-                  showPlayerError("Stream ချိတ်ဆက်မှု မအောင်မြင်ပါ။");
+                  showPlayerError("Stream \\u1001\\u103B\\u102D\\u1010\\u103A\\u1006\\u1000\\u103A\\u1019\\u103E\\u102F \\u1019\\u1021\\u1031\\u102C\\u1004\\u103A\\u1019\\u103C\\u1004\\u103A\\u1015\\u102B\\u104B");
                 }
               }, 10000);
             } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
-              console.warn("HLS media error, attempting recovery...");
               hls.recoverMediaError();
             } else {
-              showPlayerError("Stream ကြည့်ရှု၍ မရနိုင်သေးပါ။");
+              showPlayerError("Stream \\u1000\\u103C\\u100A\\u103A\\u1037\\u101B\\u103E\\u102F\\u104D \\u1019\\u101B\\u1014\\u102D\\u102F\\u1004\\u103A\\u101E\\u1031\\u1038\\u1015\\u102B\\u104B");
               hls.destroy();
               currentHls = null;
             }
@@ -1914,15 +2100,14 @@ function getHTML(): string {
         });
         vid.addEventListener("error", function onError() {
           showPlayerLoading(false);
-          showPlayerError("Stream ကြည့်ရှု၍ မရနိုင်သေးပါ။");
+          showPlayerError("Stream \\u1000\\u103C\\u100A\\u103A\\u1037\\u101B\\u103E\\u102F\\u104D \\u1019\\u101B\\u1014\\u102D\\u102F\\u1004\\u103A\\u101E\\u1031\\u1038\\u1015\\u102B\\u104B");
           vid.removeEventListener("error", onError);
         });
         vid.play().catch(function() {});
       } else {
         showPlayerLoading(false);
-        showPlayerError("သင့် Browser သည် HLS streaming ကို support မလုပ်ပါ။");
+        showPlayerError("\\u101E\\u1004\\u103A\\u1037 Browser \\u101E\\u100A\\u103A HLS streaming \\u1000\\u102D\\u102F support \\u1019\\u101C\\u102F\\u1015\\u103A\\u1015\\u102B\\u104B");
       }
-
       window.scrollTo({ top: 0, behavior: "smooth" });
     }
 
@@ -1947,10 +2132,20 @@ function getHTML(): string {
     // Initial load
     load();
 
-    // Background refresh every 60 seconds
-    setInterval(function() {
-      load();
-    }, 60000);
+    // Auto-refresh every 60 seconds
+    refreshTimerId = setInterval(function() { load(); }, 60000);
+
+    // Reduce refresh when tab is hidden (save resources)
+    document.addEventListener("visibilitychange", function() {
+      if (document.hidden) {
+        clearInterval(refreshTimerId);
+        refreshTimerId = setInterval(function() { load(); }, 300000); // 5 min when hidden
+      } else {
+        clearInterval(refreshTimerId);
+        load(); // immediate refresh when returning
+        refreshTimerId = setInterval(function() { load(); }, 60000);
+      }
+    });
   <\/script>
 </body>
 </html>`;
@@ -1964,14 +2159,12 @@ async function fetchServerURL(roomNum: any) {
     if (!/^[a-zA-Z0-9_-]+$/.test(roomStr))
       return { m3u8: null, hdM3u8: null };
 
-    // Check cache
     const cacheKey = `room_${roomStr}`;
     const cached = getCachedResponse(cacheKey);
-    if (cached) return cached;
+    if (cached) return cached.data;
 
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 8000);
-
     const res = await fetch(`${ROOM_API_BASE}/room/${roomStr}/detail.json`, {
       headers: { "User-Agent": API_USER_AGENT, Referer: API_REFERER },
       signal: controller.signal,
@@ -1987,8 +2180,7 @@ async function fetchServerURL(roomNum: any) {
           m3u8: sanitizeUrl(js.data.stream.m3u8),
           hdM3u8: sanitizeUrl(js.data.stream.hdM3u8),
         };
-        // Cache room data for 60 seconds
-        setCachedResponse(cacheKey, result, 60_000);
+        setCachedResponse(cacheKey, result, 60_000, 30_000);
         return result;
       }
     }
@@ -1998,18 +2190,16 @@ async function fetchServerURL(roomNum: any) {
   return { m3u8: null, hdM3u8: null };
 }
 
-async function fetchMatches(date: string) {
+async function fetchMatchesInternal(date: string) {
   if (!/^\d{8}$/.test(date)) return [];
 
-  // Check cache for this specific date's matches
   const dateCacheKey = `matches_date_${date}`;
   const cached = getCachedResponse(dateCacheKey);
-  if (cached) return cached;
+  if (cached && !cached.stale) return cached.data;
 
   try {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 10000);
-
     const res = await fetch(`${MATCH_API_BASE}/match/matches_${date}.json`, {
       headers: { "User-Agent": API_USER_AGENT, Referer: API_REFERER },
       signal: controller.signal,
@@ -2024,17 +2214,14 @@ async function fetchMatches(date: string) {
     if (js.code !== 200) return [];
 
     const now = Date.now();
-
     const roomFetchPromises: {
       index: number;
       promise: Promise<{ m3u8: string | null; hdM3u8: string | null }>;
     }[] = [];
-
     const prelimResults: any[] = [];
 
     for (const it of js.data) {
       const mt = it.matchTime;
-
       if (!mt || typeof mt !== "number") continue;
 
       let status: string;
@@ -2042,25 +2229,11 @@ async function fetchMatches(date: string) {
       else if (now > mt + 3 * 60 * 60 * 1000) status = "finished";
       else status = "upcoming";
 
-      const homeLogo = sanitizeUrl(
-        it.homeLogo || it.hostLogo || it.homeIcon || it.hostIcon
-      );
-      const awayLogo = sanitizeUrl(
-        it.awayLogo || it.guestLogo || it.awayIcon || it.guestIcon
-      );
-
-      const homeTeamName = sanitizeText(
-        it.homeName || it.hostName || "Home",
-        50
-      );
-      const awayTeamName = sanitizeText(
-        it.awayName || it.guestName || "Away",
-        50
-      );
-      const leagueName = sanitizeText(
-        it.leagueName || it.subCateName || "Unknown League",
-        80
-      );
+      const homeLogo = sanitizeUrl(it.homeLogo || it.hostLogo || it.homeIcon || it.hostIcon);
+      const awayLogo = sanitizeUrl(it.awayLogo || it.guestLogo || it.awayIcon || it.guestIcon);
+      const homeTeamName = sanitizeText(it.homeName || it.hostName || "Home", 50);
+      const awayTeamName = sanitizeText(it.awayName || it.guestName || "Away", 50);
+      const leagueName = sanitizeText(it.leagueName || it.subCateName || "Unknown League", 80);
 
       let matchScore: string | null = null;
       if (it.homeScore !== undefined && it.homeScore !== null) {
@@ -2070,55 +2243,35 @@ async function fetchMatches(date: string) {
       }
 
       const matchDateStr = new Intl.DateTimeFormat("en-CA", {
-        timeZone: "Asia/Yangon",
-        year: "numeric",
-        month: "2-digit",
-        day: "2-digit",
+        timeZone: "Asia/Yangon", year: "numeric", month: "2-digit", day: "2-digit",
       }).format(new Date(mt));
 
       const todayDateStr = new Intl.DateTimeFormat("en-CA", {
-        timeZone: "Asia/Yangon",
-        year: "numeric",
-        month: "2-digit",
-        day: "2-digit",
+        timeZone: "Asia/Yangon", year: "numeric", month: "2-digit", day: "2-digit",
       }).format(new Date());
 
       const tomorrowD = new Date();
       tomorrowD.setDate(tomorrowD.getDate() + 1);
       const tomorrowDateStr = new Intl.DateTimeFormat("en-CA", {
-        timeZone: "Asia/Yangon",
-        year: "numeric",
-        month: "2-digit",
-        day: "2-digit",
+        timeZone: "Asia/Yangon", year: "numeric", month: "2-digit", day: "2-digit",
       }).format(tomorrowD);
 
       const yesterdayD = new Date();
       yesterdayD.setDate(yesterdayD.getDate() - 1);
       const yesterdayDateStr = new Intl.DateTimeFormat("en-CA", {
-        timeZone: "Asia/Yangon",
-        year: "numeric",
-        month: "2-digit",
-        day: "2-digit",
+        timeZone: "Asia/Yangon", year: "numeric", month: "2-digit", day: "2-digit",
       }).format(yesterdayD);
 
       let matchDay: string;
-      if (matchDateStr === todayDateStr) {
-        matchDay = "Today";
-      } else if (matchDateStr === tomorrowDateStr) {
-        matchDay = "Tomorrow";
-      } else if (matchDateStr === yesterdayDateStr) {
-        matchDay = "Yesterday";
-      } else {
-        matchDay = matchDateStr;
-      }
+      if (matchDateStr === todayDateStr) matchDay = "Today";
+      else if (matchDateStr === tomorrowDateStr) matchDay = "Tomorrow";
+      else if (matchDateStr === yesterdayDateStr) matchDay = "Yesterday";
+      else matchDay = matchDateStr;
 
       const entryIndex = prelimResults.length;
       prelimResults.push({
         match_time: new Date(mt).toLocaleTimeString("en-US", {
-          timeZone: "Asia/Yangon",
-          hour: "2-digit",
-          minute: "2-digit",
-          hour12: true,
+          timeZone: "Asia/Yangon", hour: "2-digit", minute: "2-digit", hour12: true,
         }),
         match_day: matchDay,
         match_status: status,
@@ -2144,7 +2297,6 @@ async function fetchMatches(date: string) {
       }
     }
 
-    // Await all room fetches in parallel
     const roomResults = await Promise.allSettled(
       roomFetchPromises.map((r) => r.promise)
     );
@@ -2154,25 +2306,17 @@ async function fetchMatches(date: string) {
       if (result.status === "fulfilled") {
         const { m3u8, hdM3u8 } = result.value;
         const idx = roomFetchPromises[i].index;
-        if (m3u8)
-          prelimResults[idx].servers.push({
-            name: "Soco SD",
-            stream_url: m3u8,
-          });
-        if (hdM3u8)
-          prelimResults[idx].servers.push({
-            name: "Soco HD",
-            stream_url: hdM3u8,
-          });
+        if (m3u8) prelimResults[idx].servers.push({ name: "Soco SD", stream_url: m3u8 });
+        if (hdM3u8) prelimResults[idx].servers.push({ name: "Soco HD", stream_url: hdM3u8 });
       }
     }
 
-    // Cache this date's processed results for 30 seconds
-    setCachedResponse(dateCacheKey, prelimResults, 30_000);
-
+    setCachedResponse(dateCacheKey, prelimResults, 30_000, 30_000);
     return prelimResults;
   } catch (e) {
     console.warn(`matches ${date} error:`, e);
+    // Return stale data if available
+    if (cached) return cached.data;
     return [];
   }
 }
